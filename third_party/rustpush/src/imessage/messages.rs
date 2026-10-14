@@ -429,6 +429,18 @@ impl MessageParts {
                     let all_items: HashMap<String, String> = attributes.iter().map(|a| (a.name.to_string(), a.value.clone())).collect();
                     match name.local_name.as_str() {
                         "FILE" => {
+                            // An attachment needs either inline data or MMCS download
+                            // details. Edited Live Photos can carry a still FILE with
+                            // neither (only the paired MOV is downloadable); skip it
+                            // instead of panicking on the missing attributes.
+                            let has_attr = |name: &str| attributes.iter().any(|attr| attr.name.to_string() == name);
+                            let downloadable = ["mmcs-signature-hex", "decryption-key", "mmcs-owner", "mmcs-url", "file-size"]
+                                .iter().all(|name| has_attr(name));
+                            if !has_attr("inline-attachment") && !downloadable {
+                                warn!("skipping attachment {:?} with no inline data or MMCS download details",
+                                    attributes.iter().find(|attr| attr.name.to_string() == "name").map(|attr| attr.value.as_str()));
+                                continue
+                            }
                             if staging_item.is_some() {
                                 data.push(IndexedMessagePart {
                                     part: staging_item.take().unwrap().complete(std::mem::take(&mut string_buf), mem::take(&mut staging_format)), 
@@ -2900,5 +2912,26 @@ impl MessageInst {
 impl fmt::Display for MessageInst {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "[{}] '{}'", self.sender.clone().unwrap_or("unknown".to_string()), self.message)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // `ix` payload of an edited Live Photo as received: the still FILE has no
+    // MMCS download attributes, only the paired MOV does.
+    const EDITED_LIVE_PHOTO_XML: &str = r#"<html><body><FILE name="FullSizeRender.heic.jpeg" width="0" height="0" datasize="3463502" mime-type="image/jpeg" uti-type="public.jpeg"/><FILE name="FullSizeRender.MOV" width="0" height="0" datasize="6067172" iris="yes" mime-type="video/quicktime" uti-type="com.apple.quicktime-movie" mmcs-signature-hex="8184501587CA4DA685DBDC5943867042B0714B8C97" mmcs-url="https://p179-content.icloud.com/OWNER" file-size="6067172" decryption-key="00612CFF8F4EC8FE5935FC1CB0A9A3C15DA7E433F155A232A8D2BFBD7043347D15" mmcs-owner="OWNER"/></body></html>"#;
+
+    #[test]
+    fn parse_parts_skips_file_without_download_details() {
+        let parts = MessageParts::parse_parts(EDITED_LIVE_PHOTO_XML, None);
+        let attachments: Vec<&Attachment> = parts.0.iter().filter_map(|p| match &p.part {
+            MessagePart::Attachment(a) => Some(a),
+            _ => None,
+        }).collect();
+        assert_eq!(attachments.len(), 1);
+        assert_eq!(attachments[0].name, "FullSizeRender.MOV");
+        assert!(attachments[0].iris);
     }
 }

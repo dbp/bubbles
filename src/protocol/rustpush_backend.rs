@@ -746,6 +746,8 @@ where
 ///   `on_dropped` is where a backfill sync gets triggered.
 /// * On `Closed` the loop re-subscribes (with infinite retry via
 ///   [`subscribe_with_reconnect`]).
+/// * If `process` panics, that message is logged, reported through
+///   `on_dropped`, and the loop continues.
 /// * A `kick` (wake from sleep) only short-circuits the reconnect backoff in
 ///   [`subscribe_with_reconnect`]. It deliberately does **not** re-subscribe:
 ///   the broadcast receiver lives on the connection resource and survives
@@ -766,7 +768,7 @@ async fn run_receive_loop<S, P, R, D, SFut, RFut>(
 where
     S: Fn() -> Result<tokio::sync::broadcast::Receiver<APSMessage>, ConnectionDead> + Send,
     P: Fn(APSMessage) -> SFut + Send,
-    SFut: std::future::Future<Output = ()> + Send,
+    SFut: std::future::Future<Output = ()> + Send + 'static,
     R: Fn() -> RFut + Send,
     RFut: std::future::Future<Output = Result<(), ReconnectError>> + Send,
     D: Fn(u64) + Send,
@@ -776,7 +778,26 @@ where
     loop {
         tokio::select! {
             result = rx.recv() => match result {
-                Ok(msg) => process(msg).await,
+                // Each message runs in its own task so a panic while decoding
+                // one (rustpush `expect`s on malformed payloads) drops only that
+                // message instead of silently ending all receiving. Still
+                // awaited inline, so messages stay ordered.
+                Ok(msg) => {
+                    if let Err(e) = tokio::spawn(process(msg)).await {
+                        if e.is_panic() {
+                            let payload = e.into_panic();
+                            let reason = payload
+                                .downcast_ref::<&str>()
+                                .map(|s| s.to_string())
+                                .or_else(|| payload.downcast_ref::<String>().cloned())
+                                .unwrap_or_default();
+                            log::error!(
+                                "panic while processing an APNs message; dropping it: {reason}"
+                            );
+                            on_dropped(1);
+                        }
+                    }
+                }
                 Err(broadcast::error::RecvError::Lagged(n)) => {
                     log::error!(
                         "receive loop lagged: {n} APNs messages were dropped after being \
@@ -4006,6 +4027,74 @@ mod tests {
             processed_count.load(Ordering::SeqCst),
             2,
             "messages after the kick arrive on the same subscription"
+        );
+
+        handle.abort();
+    }
+
+    /// Pin: a panic while processing one message (e.g. rustpush failing to
+    /// decode it) drops only that message. It is reported through
+    /// `on_dropped` and the loop keeps receiving instead of dying silently.
+    #[tokio::test]
+    async fn receive_loop_survives_panic_in_process() {
+        use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+        use std::sync::{Arc, Mutex};
+        use std::time::Duration;
+        use tokio::sync::broadcast;
+        use tokio::sync::Notify;
+
+        let (tx, _rx) = broadcast::channel::<APSMessage>(8);
+        let rx = tx.subscribe();
+        let rx_cell = Mutex::new(Some(rx));
+        let subscribe = move || -> Result<_, ConnectionDead> {
+            Ok(rx_cell
+                .lock()
+                .unwrap()
+                .take()
+                .expect("subscribe is called exactly once"))
+        };
+
+        let seen = Arc::new(AtomicUsize::new(0));
+        let processed_count = Arc::new(AtomicUsize::new(0));
+        let process = {
+            let seen = Arc::clone(&seen);
+            let processed = Arc::clone(&processed_count);
+            move |_msg: APSMessage| {
+                let first = seen.fetch_add(1, Ordering::SeqCst) == 0;
+                let p = Arc::clone(&processed);
+                async move {
+                    if first {
+                        panic!("simulated decode panic");
+                    }
+                    p.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+        };
+
+        let dropped = Arc::new(AtomicU64::new(0));
+        let on_dropped = {
+            let dropped = Arc::clone(&dropped);
+            move |n: u64| {
+                dropped.fetch_add(n, Ordering::SeqCst);
+            }
+        };
+
+        let reconnect = || async { Ok::<(), ReconnectError>(()) };
+        let handle = tokio::spawn(async move {
+            run_receive_loop(subscribe, process, Arc::new(Notify::new()), reconnect, on_dropped)
+                .await;
+        });
+
+        tx.send(APSMessage::Ping).unwrap();
+        tx.send(APSMessage::Ping).unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        assert!(!handle.is_finished(), "the loop must survive a panicking message");
+        assert_eq!(dropped.load(Ordering::SeqCst), 1, "the panicked message is reported as dropped");
+        assert_eq!(
+            processed_count.load(Ordering::SeqCst),
+            1,
+            "the message after the panic is still processed"
         );
 
         handle.abort();
