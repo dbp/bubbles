@@ -15,6 +15,8 @@ mod window_state;
 mod attachment_cache;
 mod contacts;
 mod contacts_eds;
+mod contacts_vdir;
+mod vcard;
 mod demo;
 mod video;
 

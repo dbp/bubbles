@@ -33,6 +33,7 @@ finish-args:
   - --talk-name=org.freedesktop.Notifications   # desktop notifications
   - --talk-name=org.kde.StatusNotifierWatcher   # system tray (ksni)
   - --talk-name=org.freedesktop.portal.OpenURI   # link opening via GIO
+  - --filesystem=xdg-data/contacts:ro   # vCard folder (iccontacts, vdirsyncer)
   # messages.db + rustpush credentials live under the per-app data dir
   # (XDG_DATA_HOME -> ~/.var/app/io.github.chrispouliot.Bubbles/data/bubbles),
   # which Flatpak sandboxes automatically. No host --filesystem grant needed

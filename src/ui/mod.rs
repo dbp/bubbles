@@ -1072,14 +1072,19 @@ pub fn enter_messaging(
             }
             ui_for_cache.reload_chats(|_| {});
 
-            // Now refresh from EDS in the background. On success, update the
-            // in-memory cache and re-render. On failure, the persisted cache
-            // (or empty) stays — graceful degradation.
+            // Now refresh from EDS and the vCard folder in the background. On
+            // success, update the in-memory cache and re-render. If every
+            // source fails, the persisted cache (or empty) stays — graceful
+            // degradation.
             let ui_for_contacts = ui_for_cache.clone();
             let store_for_contacts = ui_for_contacts.store.clone();
             gtk_bridge::spawn(
                 async move {
-                    let source = crate::contacts_eds::EdsContactSource;
+                    use crate::contacts_vdir::VdirContactSource;
+                    let source = crate::contacts::CombinedContactSource(vec![
+                        Box::new(crate::contacts_eds::EdsContactSource),
+                        Box::new(VdirContactSource::new(VdirContactSource::default_root())),
+                    ]);
                     crate::contacts::refresh_and_collect(&source, &store_for_contacts).await
                 },
                 move |result| {
@@ -1089,7 +1094,7 @@ pub fn enter_messaging(
                             ui_for_contacts.schedule_refresh();
                         }
                         Err(e) => {
-                            eprintln!("contact refresh failed (EDS unavailable?): {e:#}");
+                            eprintln!("contact refresh failed: {e:#}");
                         }
                     }
                 },

@@ -330,6 +330,32 @@ pub trait ContactSource: Send + Sync {
     async fn fetch_all(&self) -> anyhow::Result<Vec<Contact>>;
 }
 
+/// Several [`ContactSource`]s read as one. It fails only when every source
+/// fails, so a desktop without Evolution still gets contacts from a vCard
+/// folder (and vice versa).
+pub struct CombinedContactSource(pub Vec<Box<dyn ContactSource>>);
+
+#[async_trait]
+impl ContactSource for CombinedContactSource {
+    async fn fetch_all(&self) -> anyhow::Result<Vec<Contact>> {
+        let mut contacts = Vec::new();
+        let mut errors = Vec::new();
+        for source in &self.0 {
+            match source.fetch_all().await {
+                Ok(found) => contacts.push(found),
+                Err(e) => errors.push(format!("{e:#}")),
+            }
+        }
+        if contacts.is_empty() && !errors.is_empty() {
+            anyhow::bail!("{}", errors.join("; "));
+        }
+        for e in &errors {
+            eprintln!("contact source unavailable: {e}");
+        }
+        Ok(contacts.into_iter().flatten().collect())
+    }
+}
+
 /// Refresh the in-app contact cache from `source`.
 ///
 /// 1. `fetch_all` from the source — on error the cache is **not** touched.
@@ -1410,5 +1436,66 @@ mod tests {
             "error should contain source error message: {}",
             err,
         );
+    }
+
+    // ------------------------------------------------------------------
+    // CombinedContactSource
+    // ------------------------------------------------------------------
+
+    fn named(uid: &str, name: &str) -> Contact {
+        Contact { uid: uid.into(), display_name: name.into(), avatar: None, addresses: vec![] }
+    }
+
+    fn ok_source(contacts: Vec<Contact>) -> Box<dyn super::ContactSource> {
+        Box::new(FakeContactSource { contacts, error: None })
+    }
+
+    fn failing_source(msg: &str) -> Box<dyn super::ContactSource> {
+        Box::new(FakeContactSource { contacts: vec![], error: Some(msg.into()) })
+    }
+
+    #[tokio::test]
+    async fn combined_source_merges_every_source() {
+        use super::ContactSource;
+        let source = super::CombinedContactSource(vec![
+            ok_source(vec![named("1", "Ann")]),
+            ok_source(vec![named("2", "Bob")]),
+        ]);
+        let names: Vec<String> =
+            source.fetch_all().await.unwrap().into_iter().map(|c| c.display_name).collect();
+        assert_eq!(names, ["Ann", "Bob"]);
+    }
+
+    #[tokio::test]
+    async fn combined_source_tolerates_one_failing_source() {
+        use super::ContactSource;
+        let source = super::CombinedContactSource(vec![
+            failing_source("EDS unavailable"),
+            ok_source(vec![named("2", "Bob")]),
+        ]);
+        let names: Vec<String> =
+            source.fetch_all().await.unwrap().into_iter().map(|c| c.display_name).collect();
+        assert_eq!(names, ["Bob"]);
+    }
+
+    #[tokio::test]
+    async fn combined_source_succeeds_when_one_source_is_empty() {
+        use super::ContactSource;
+        let source = super::CombinedContactSource(vec![
+            failing_source("EDS unavailable"),
+            ok_source(vec![]),
+        ]);
+        assert!(source.fetch_all().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn combined_source_fails_only_when_every_source_fails() {
+        use super::ContactSource;
+        let source = super::CombinedContactSource(vec![
+            failing_source("EDS unavailable"),
+            failing_source("no vCard folder"),
+        ]);
+        let err = source.fetch_all().await.unwrap_err().to_string();
+        assert!(err.contains("EDS unavailable") && err.contains("no vCard folder"), "{err}");
     }
 }

@@ -1,0 +1,92 @@
+BEGIN:VCARD
+VERSION:3.0
+PRODID:-//iccontacts//iCloud Contacts//EN
+UID:demo-3
+FN:Corner Bakery
+N:;;;;
+ORG:Corner Bakery
+X-ABShowAs:COMPANY
+TEL;TYPE=MAIN:+1 (555) 010-0104
+ADR;TYPE=WORK:;;400 Main Street;Springfield;IL;62701;United States
+END:VCARD
+BEGIN:VCARD
+VERSION:3.0
+PRODID:-//iccontacts//iCloud Contacts//EN
+UID:demo-8
+FN:Margaret Hamilton
+N:Hamilton;Margaret;;;
+ORG:MIT Instrumentation Lab
+TEL;TYPE=HOME:+1 (555) 010-0109
+EMAIL;TYPE=INTERNET,HOME:margaret@example.com
+EMAIL;TYPE=INTERNET,WORK:mh@example.edu
+ADR;TYPE=WORK:;;75 Cambridge Parkway;Cambridge;MA;02142;United States
+END:VCARD
+BEGIN:VCARD
+VERSION:3.0
+PRODID:-//iccontacts//iCloud Contacts//EN
+UID:demo-2
+FN:Rear Adm. Grace Hopper
+N:Hopper;Grace;;Rear Adm.;
+TEL;TYPE=WORK:+1 (555) 010-0102
+TEL;TYPE=IPHONE,CELL:+1 (555) 010-0103
+EMAIL;TYPE=INTERNET,WORK:grace@example.org
+URL;TYPE=HOMEPAGE:https://example.org/grace
+PHOTO;ENCODING=b;TYPE=PNG:iVBORw0KGgowMTIzNDU2Nzg5iVBORw0KGgowMTIzNDU2Nzg5i
+ VBORw0KGgowMTIzNDU2Nzg5iVBORw0KGgowMTIzNDU2Nzg5iVBORw0KGgowMTIzNDU2Nzg5iVB
+ ORw0KGgowMTIzNDU2Nzg5iVBORw0KGgowMTIzNDU2Nzg5iVBORw0KGgowMTIzNDU2Nzg5
+END:VCARD
+BEGIN:VCARD
+VERSION:3.0
+PRODID:-//iccontacts//iCloud Contacts//EN
+UID:demo-5
+FN:Katherine Johnson
+N:Johnson;Katherine;;;
+ORG:NACA;Flight Research
+TITLE:Mathematician
+TEL;TYPE=WORK,FAX:+1 (555) 010-0106
+TEL;TYPE=CELL:+1 (555) 010-0107
+EMAIL;TYPE=INTERNET,WORK:katherine@example.org
+END:VCARD
+BEGIN:VCARD
+VERSION:3.0
+PRODID:-//iccontacts//iCloud Contacts//EN
+UID:demo-6
+FN:Linus
+N:;Linus;;;
+TEL;TYPE=CELL:+358 40 010 0108
+END:VCARD
+BEGIN:VCARD
+VERSION:3.0
+PRODID:-//iccontacts//iCloud Contacts//EN
+UID:demo-1
+FN:Ada Lovelace
+N:Lovelace;Ada;;;
+ORG:Analytical Engines Ltd
+TITLE:Programmer
+TEL;TYPE=CELL:+44 20 7946 0101
+EMAIL;TYPE=INTERNET,HOME:ada@example.com
+ADR;TYPE=HOME:;;12 St James's Square;London;;SW1Y 4JH;United Kingdom
+BDAY:1815-12-10
+NOTE:Writes the best notes on anyone's engine.
+END:VCARD
+BEGIN:VCARD
+VERSION:3.0
+PRODID:-//iccontacts//iCloud Contacts//EN
+UID:demo-7
+FN:someone@example.com
+N:;;;;
+EMAIL;TYPE=INTERNET,HOME:someone@example.com
+END:VCARD
+BEGIN:VCARD
+VERSION:3.0
+PRODID:-//iccontacts//iCloud Contacts//EN
+UID:demo-4
+FN:Alan Turing
+N:Turing;Alan;;;
+NICKNAME:Prof
+item1.TEL:+44 161 496 0105
+item1.X-ABLabel:Grandma's line
+EMAIL;TYPE=INTERNET:alan@example.net
+BDAY;X-APPLE-OMIT-YEAR=1604:1604-06-23
+END:VCARD
+
