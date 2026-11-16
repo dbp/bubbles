@@ -32,6 +32,13 @@ fn main() -> Result<()> {
             );
         }
 
+        // Unicorn's QEMU core uses 128-bit atomics, which GCC lowers to
+        // libatomic calls on x86-64. The Nix flake adds -latomic; do the same
+        // here so a plain `cargo build` links on other distros too.
+        if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("linux") {
+            println!("cargo:rustc-link-lib=atomic");
+        }
+
         let mut prost_build = prost_build::Config::new();
         prost_build.protoc_arg("--experimental_allow_proto3_optional");
         prost_build.compile_protos(&["src/mac_hw_info.proto"], &["src/"])?;
