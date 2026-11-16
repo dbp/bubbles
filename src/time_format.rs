@@ -1,7 +1,7 @@
 //! Persist and restore the user's choice of 12-hour (AM/PM) or 24-hour clock
 //! for chat-message timestamps.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use gtk::glib;
 
@@ -30,28 +30,32 @@ pub enum TimeFormat {
 /// Default time format: 12-hour AM/PM.
 pub const DEFAULT: TimeFormat = TimeFormat::AmPm;
 
-#[cfg(not(test))]
 const STATE_FILE: &str = "time_format.txt";
 
-/// Data directory for bubbles. `pub(crate)` for test access.
-pub(crate) fn data_dir() -> PathBuf {
+/// Data directory for bubbles.
+fn data_dir() -> PathBuf {
     glib::user_data_dir().join("bubbles")
 }
 
-/// Path to the time-format state file. `pub(crate)` for test access.
-pub(crate) fn state_path() -> PathBuf {
-    #[cfg(test)]
-    return data_dir().join(format!(
-        "time_format-{:?}.txt",
-        std::thread::current().id()
-    ));
-    #[cfg(not(test))]
+/// Path to the time-format state file.
+fn state_path() -> PathBuf {
     data_dir().join(STATE_FILE)
 }
 
 /// Read the saved time format, or [`DEFAULT`] if nothing is saved yet.
 pub fn get() -> TimeFormat {
-    let data = match std::fs::read_to_string(state_path()) {
+    get_from(&state_path())
+}
+
+/// Save a time format to disk. Creates the parent directory if needed.
+pub fn set(mode: TimeFormat) {
+    set_to(&state_path(), mode)
+}
+
+/// [`get`] against an explicit state file, so tests never touch the real
+/// data directory.
+fn get_from(path: &Path) -> TimeFormat {
+    let data = match std::fs::read_to_string(path) {
         Ok(d) => d,
         Err(_) => return DEFAULT,
     };
@@ -61,13 +65,12 @@ pub fn get() -> TimeFormat {
     }
 }
 
-/// Save a time format to disk. Creates the parent directory if needed.
-pub fn set(mode: TimeFormat) {
-    let path = state_path();
+/// [`set`] against an explicit state file.
+fn set_to(path: &Path, mode: TimeFormat) {
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    let _ = std::fs::write(&path, match mode {
+    let _ = std::fs::write(path, match mode {
         TimeFormat::AmPm => "0",
         TimeFormat::H24 => "1",
     });
@@ -196,24 +199,13 @@ fn calendar_date(ms: i64) -> (i32, i32, i32) {
 mod tests {
     use super::*;
 
-    /// Pin the timezone and XDG data dir once per process so that
-    /// `format_time` assertions are deterministic regardless of where CI runs.
-    fn setup_isolated_data_dir() {
+    /// Pin the timezone once per process so that `format_time` assertions are
+    /// deterministic regardless of where CI runs.
+    fn pin_tz_utc() {
         static INIT: std::sync::Once = std::sync::Once::new();
         INIT.call_once(|| {
             // TZ=UTC ensures from_unix_local agrees with our datetime_ms helper.
             std::env::set_var("TZ", "UTC");
-            let dir = std::env::temp_dir().join(format!(
-                "openbubbles-time-format-test-{}-{}",
-                std::process::id(),
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_nanos()
-            ));
-            std::fs::create_dir_all(&dir).unwrap();
-            // g_get_user_data_dir reads XDG_DATA_HOME.
-            std::env::set_var("XDG_DATA_HOME", &dir);
         });
     }
 
@@ -236,16 +228,19 @@ mod tests {
         era as i64 * 146097 + doe - 719468
     }
 
-    /// Path to the state file, delegating to the module's helper.
-    fn state_file_path() -> PathBuf {
-        super::state_path()
+    /// A state-file path inside a fresh temp dir. Keep the `TempDir` alive for
+    /// the test's duration; dropping it deletes the directory.
+    fn temp_state_file() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bubbles").join(super::STATE_FILE);
+        (dir, path)
     }
 
     // --- format_time tests ---
 
     #[test]
     fn format_time_ampm_afternoon_uses_leading_zero_and_pm() {
-        setup_isolated_data_dir();
+        pin_tz_utc();
         let ms = datetime_ms(2024, 1, 15, 13, 30, 0);
         assert_eq!(
             format_time(ms, TimeFormat::AmPm),
@@ -255,7 +250,7 @@ mod tests {
 
     #[test]
     fn format_time_ampm_morning() {
-        setup_isolated_data_dir();
+        pin_tz_utc();
         let ms = datetime_ms(2024, 1, 15, 9, 5, 0);
         assert_eq!(
             format_time(ms, TimeFormat::AmPm),
@@ -265,7 +260,7 @@ mod tests {
 
     #[test]
     fn format_time_ampm_midnight_is_12_am() {
-        setup_isolated_data_dir();
+        pin_tz_utc();
         let ms = datetime_ms(2024, 1, 15, 0, 0, 0);
         assert_eq!(
             format_time(ms, TimeFormat::AmPm),
@@ -275,7 +270,7 @@ mod tests {
 
     #[test]
     fn format_time_ampm_noon_is_12_pm() {
-        setup_isolated_data_dir();
+        pin_tz_utc();
         let ms = datetime_ms(2024, 1, 15, 12, 0, 0);
         assert_eq!(
             format_time(ms, TimeFormat::AmPm),
@@ -285,7 +280,7 @@ mod tests {
 
     #[test]
     fn format_time_24h_afternoon() {
-        setup_isolated_data_dir();
+        pin_tz_utc();
         let ms = datetime_ms(2024, 1, 15, 13, 30, 0);
         assert_eq!(
             format_time(ms, TimeFormat::H24),
@@ -295,7 +290,7 @@ mod tests {
 
     #[test]
     fn format_time_24h_midnight() {
-        setup_isolated_data_dir();
+        pin_tz_utc();
         let ms = datetime_ms(2024, 1, 15, 0, 0, 0);
         assert_eq!(
             format_time(ms, TimeFormat::H24),
@@ -305,7 +300,7 @@ mod tests {
 
     #[test]
     fn format_time_24h_noon() {
-        setup_isolated_data_dir();
+        pin_tz_utc();
         let ms = datetime_ms(2024, 1, 15, 12, 0, 0);
         assert_eq!(
             format_time(ms, TimeFormat::H24),
@@ -317,34 +312,30 @@ mod tests {
 
     #[test]
     fn default_is_ampm_when_no_file() {
-        setup_isolated_data_dir();
-        let _ = std::fs::remove_file(state_file_path());
-        assert_eq!(get(), TimeFormat::AmPm);
+        let (_dir, path) = temp_state_file();
+        assert_eq!(get_from(&path), TimeFormat::AmPm);
     }
 
     #[test]
     fn set_then_get_roundtrips_ampm() {
-        setup_isolated_data_dir();
-        // Start clean so prior test in this process doesn't bleed into this one.
-        let _ = std::fs::remove_file(state_file_path());
-        set(TimeFormat::AmPm);
-        assert_eq!(get(), TimeFormat::AmPm);
+        let (_dir, path) = temp_state_file();
+        set_to(&path, TimeFormat::AmPm);
+        assert_eq!(get_from(&path), TimeFormat::AmPm);
     }
 
     #[test]
     fn set_then_get_roundtrips_h24() {
-        setup_isolated_data_dir();
-        let _ = std::fs::remove_file(state_file_path());
-        set(TimeFormat::H24);
-        assert_eq!(get(), TimeFormat::H24);
+        let (_dir, path) = temp_state_file();
+        set_to(&path, TimeFormat::H24);
+        assert_eq!(get_from(&path), TimeFormat::H24);
     }
 
     #[test]
     fn corrupted_file_falls_back_to_default() {
-        setup_isolated_data_dir();
-        std::fs::create_dir_all(state_file_path().parent().unwrap()).unwrap();
-        std::fs::write(state_file_path(), "garbage not a 0 or 1").unwrap();
-        assert_eq!(get(), TimeFormat::AmPm);
+        let (_dir, path) = temp_state_file();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "garbage not a 0 or 1").unwrap();
+        assert_eq!(get_from(&path), TimeFormat::AmPm);
     }
 
     // --- full timestamp formatter (hover tooltip) ---
@@ -353,7 +344,7 @@ mod tests {
     /// Pinned to a single stable format so the tooltip text is deterministic.
     #[test]
     fn format_full_timestamp_ampm() {
-        setup_isolated_data_dir();
+        pin_tz_utc();
         let ms = datetime_ms(2024, 6, 15, 13, 30, 0);
         assert_eq!(
             format_full_timestamp(ms, TimeFormat::AmPm),
@@ -364,7 +355,7 @@ mod tests {
     /// Hover tooltip on a message: local date + time, H24 mode.
     #[test]
     fn format_full_timestamp_h24() {
-        setup_isolated_data_dir();
+        pin_tz_utc();
         let ms = datetime_ms(2024, 6, 15, 13, 30, 0);
         assert_eq!(
             format_full_timestamp(ms, TimeFormat::H24),
@@ -379,7 +370,7 @@ mod tests {
     /// components).
     #[test]
     fn format_date_label_is_stable_human_readable() {
-        setup_isolated_data_dir();
+        pin_tz_utc();
         let ms = datetime_ms(2024, 6, 15, 13, 30, 0);
         assert_eq!(format_date_label(ms), "June 15, 2024");
     }
@@ -395,7 +386,7 @@ mod tests {
     /// today=2024-06-15; current message is also today → no divider.
     #[test]
     fn should_show_date_divider_false_for_today_message() {
-        setup_isolated_data_dir();
+        pin_tz_utc();
         let now = datetime_ms(2024, 6, 15, 12, 0, 0);
         let current = datetime_ms(2024, 6, 15, 8, 0, 0);
         let prev = Some(datetime_ms(2024, 6, 15, 9, 0, 0));
@@ -405,7 +396,7 @@ mod tests {
     /// First message in a chat (no previous) and it is non-today → divider.
     #[test]
     fn should_show_date_divider_true_for_first_non_today_message() {
-        setup_isolated_data_dir();
+        pin_tz_utc();
         let now = datetime_ms(2024, 6, 15, 12, 0, 0);
         let current = datetime_ms(2024, 6, 14, 10, 0, 0);
         assert!(should_show_date_divider(None, current, now));
@@ -414,7 +405,7 @@ mod tests {
     /// Crossing from one non-today date to a different non-today date → divider.
     #[test]
     fn should_show_date_divider_true_when_crossing_non_today_dates() {
-        setup_isolated_data_dir();
+        pin_tz_utc();
         let now = datetime_ms(2024, 6, 15, 12, 0, 0);
         let prev = Some(datetime_ms(2024, 6, 13, 10, 0, 0));
         let current = datetime_ms(2024, 6, 14, 10, 0, 0);
@@ -425,7 +416,7 @@ mod tests {
     /// divider on the second one.
     #[test]
     fn should_show_date_divider_false_for_consecutive_same_non_today_date() {
-        setup_isolated_data_dir();
+        pin_tz_utc();
         let now = datetime_ms(2024, 6, 15, 12, 0, 0);
         let prev = Some(datetime_ms(2024, 6, 14, 9, 0, 0));
         let current = datetime_ms(2024, 6, 14, 18, 0, 0);
@@ -438,7 +429,7 @@ mod tests {
     /// duplicate divider.
     #[test]
     fn should_show_date_divider_true_when_crossing_from_previous_day_to_today() {
-        setup_isolated_data_dir();
+        pin_tz_utc();
         let now = datetime_ms(2024, 6, 15, 12, 0, 0);
         let prev = Some(datetime_ms(2024, 6, 14, 10, 0, 0));
         let current = datetime_ms(2024, 6, 15, 8, 0, 0);
