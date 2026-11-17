@@ -1125,6 +1125,36 @@ impl super::Ui {
         confirm.present(Some(&self.split));
     }
 
+    /// "Mark All as Read" from the main menu, after a confirmation. Local
+    /// only: no read receipts go out (senders of months-old messages would
+    /// suddenly see them read) and nothing changes in iCloud or on the phone.
+    pub(super) fn confirm_mark_all_read(&self) {
+        let confirm = adw::AlertDialog::new(
+            Some("Mark All as Read?"),
+            Some("Every conversation here is marked read. Nobody is told you read their messages, and nothing changes on your phone or in iCloud."),
+        );
+        confirm.add_responses(&[("cancel", "Cancel"), ("mark", "Mark All as Read")]);
+        confirm.set_response_appearance("mark", adw::ResponseAppearance::Suggested);
+        confirm.set_default_response(Some("cancel"));
+        confirm.set_close_response("cancel");
+        let ui = self.clone();
+        confirm.connect_response(None, move |_, resp| {
+            if resp != "mark" {
+                return;
+            }
+            let store = ui.store.clone();
+            let ui = ui.clone();
+            gtk_bridge::spawn(async move { store.mark_all_read().await }, move |result| {
+                match result {
+                    Ok(n) => log::info!("marked {n} messages read"),
+                    Err(e) => log::error!("mark all as read failed: {e:#}"),
+                }
+                ui.reload_open_chat();
+            });
+        });
+        confirm.present(Some(&self.split));
+    }
+
     pub(super) fn show_about(&self) {
         let about = adw::AboutDialog::builder()
             .application_name("Bubbles")

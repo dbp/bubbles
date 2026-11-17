@@ -268,6 +268,17 @@ pub fn mark_read_through(c: &Connection, chat_id: i64, date: i64) -> rusqlite::R
     Ok(())
 }
 
+/// Mark every inbound message read, in every chat. Local only: it sends no
+/// read receipts and changes nothing in iCloud (marking months of old
+/// messages read for their senders would be wrong). Returns how many
+/// messages changed.
+pub fn mark_all_read(c: &Connection) -> rusqlite::Result<usize> {
+    c.execute(
+        "UPDATE message SET read_sent = 1 WHERE is_from_me = 0 AND read_sent = 0",
+        [],
+    )
+}
+
 /// Mark as read any inbound message that already has a *later* message we sent in
 /// the same chat. Replying after a message proves we saw it, so even if a read
 /// receipt never arrives (receipts off, lost, or never echoed) the unread state
@@ -1361,6 +1372,11 @@ impl Store {
             .await?)
     }
 
+    /// See [`mark_all_read`]: local only, no receipts.
+    pub async fn mark_all_read(&self) -> Result<usize> {
+        Ok(self.conn.call(|c| Ok(mark_all_read(c)?)).await?)
+    }
+
     pub async fn mark_read_through(&self, chat_id: i64, date: i64) -> Result<()> {
         self.conn
             .call(move |c| {
@@ -1808,6 +1824,48 @@ mod tests {
         assert_eq!(msgs.len(), 1, "receipt did not insert a new row");
         assert_eq!(msgs[0].date_read, Some(2500));
         assert_eq!(msgs[0].date_delivered, None);
+    }
+
+    /// Pin: "Mark All as Read" clears unread in every chat, touches only
+    /// incoming messages, records no read time (nothing was sent), and is a
+    /// no-op the second time.
+    #[test]
+    fn mark_all_read_clears_every_chat_locally() {
+        let mut c = db();
+        apply_blocking(&mut c, Ingest::Message(msg("I1", 1000))).unwrap();
+        apply_blocking(&mut c, Ingest::Message(msg("I2", 1100))).unwrap();
+        let other = ChatRef {
+            participants: vec!["tel:+15550199".into(), "mailto:me@icloud.com".into()],
+            display_name: None,
+            service: Some("iMessage".into()),
+        };
+        apply_blocking(
+            &mut c,
+            Ingest::Message(IncomingMessage { chat: other.clone(), ..msg("J1", 1200) }),
+        )
+        .unwrap();
+        apply_blocking(
+            &mut c,
+            Ingest::Message(IncomingMessage {
+                chat: other,
+                is_from_me: true,
+                sender: None,
+                ..msg("MINE", 900)
+            }),
+        )
+        .unwrap();
+        let unread_total = |c: &Connection| -> i64 {
+            query_chats(c).unwrap().iter().map(|ch| ch.unread).sum()
+        };
+        assert_eq!(unread_total(&c), 3);
+
+        assert_eq!(mark_all_read(&c).unwrap(), 3);
+        assert_eq!(unread_total(&c), 0);
+        let read_times: i64 = c
+            .query_row("SELECT COUNT(*) FROM message WHERE date_read IS NOT NULL", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(read_times, 0, "no read time recorded: nothing was sent");
+        assert_eq!(mark_all_read(&c).unwrap(), 0, "already read");
     }
 
     #[test]

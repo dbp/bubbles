@@ -459,6 +459,7 @@ pub fn enter_messaging(
     });
     // Hamburger menu at the end of the sidebar header.
     let main_menu = gtk::gio::Menu::new();
+    main_menu.append(Some("Mark All as Read"), Some("menu.mark-all-read"));
     main_menu.append(Some("Preferences"), Some("menu.preferences"));
     main_menu.append(Some("About"), Some("menu.about"));
     let menu_button = gtk::MenuButton::builder()
@@ -809,6 +810,12 @@ pub fn enter_messaging(
     // Sidebar hamburger menu actions ("menu" group, resolved via the split).
     {
         let actions = gtk::gio::SimpleActionGroup::new();
+        let mark_all_read = gtk::gio::SimpleAction::new("mark-all-read", None);
+        mark_all_read.connect_activate({
+            let ui = ui.clone();
+            move |_, _| ui.confirm_mark_all_read()
+        });
+        actions.add_action(&mark_all_read);
         let preferences = gtk::gio::SimpleAction::new("preferences", None);
         preferences.connect_activate({
             let ui = ui.clone();
