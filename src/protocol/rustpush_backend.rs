@@ -397,6 +397,46 @@ impl<P: rustpush::AnisetteProvider + Send + Sync> crate::sync::CloudKitSync for 
 /// Deleted" messages and message edits in zones rustpush has no types for,
 /// so this is how their schema gets learned from real data before the sync
 /// acts on them. Never fails the sync; every problem is just logged.
+/// Sync Now only: how the newest message records' `chat_id`s line up with
+/// the chat zone, as identifier shapes and counts (never identifiers or
+/// text). Finds the records `chat_ref_for` can't resolve to a conversation.
+async fn log_message_chat_ids<P: rustpush::AnisetteProvider + Send + Sync>(
+    fetcher: &CloudZoneFetcher<P>,
+    chat_map: &std::collections::HashMap<String, rustpush::cloud_messages::CloudChat>,
+    chat_cache: &crate::sync::CloudChatCache,
+) {
+    let page = match fetcher
+        .fetch_zone::<rustpush::cloud_messages::CloudMessage>("messageManateeZone", None, true)
+        .await
+    {
+        Ok((_, page, _)) => page,
+        Err(e) => {
+            log::warn!("message chat ids: fetch failed: {e:?}");
+            return;
+        }
+    };
+    let mut counts: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    for cm in page.values().flatten() {
+        let (hit, group) = crate::sync::chat_id_match(&cm.chat_id, chat_map, chat_cache);
+        let kind = match group {
+            Some(true) => " (group chat)",
+            Some(false) => " (1:1 chat)",
+            None => "",
+        };
+        let key = format!(
+            "chat_id {} svc {} sender {} -> {hit}{kind}",
+            crate::sync::chat_id_shape(&cm.chat_id),
+            cm.service,
+            if cm.sender.is_empty() { "empty" } else { "set" },
+        );
+        *counts.entry(key).or_default() += 1;
+    }
+    log::info!("message chat ids: {} records in the newest page", page.len());
+    for (what, n) in counts {
+        log::info!("message chat ids: {n} x {what}");
+    }
+}
+
 async fn log_zone_schema<P: rustpush::AnisetteProvider>(
     client: &rustpush::cloud_messages::CloudMessagesClient<P>,
     zone_name: &str,
@@ -1896,14 +1936,23 @@ impl Backend for RustpushBackend {
         let bubbles_config =
             crate::sync::read_config(&dir.join(crate::sync::CONFIG_FILENAME));
         let now_ms = now_ms();
-        // A wider history window than the initial scan stored: walk the
-        // message zone again. Messages already stored are matched by guid,
-        // so nothing is duplicated.
+        // A wider history window than the initial scan stored, or a scan an
+        // older build filed differently: walk the message zone again.
+        // Messages already stored are matched by guid, so nothing is
+        // duplicated, and misfiled ones move to their conversation.
         if crate::sync::needs_rescan(&cursor, bubbles_config.import_history, now_ms) {
-            log::info!(
-                "history window is now {:?}, wider than the last scan stored; rescanning iCloud messages",
-                bubbles_config.import_history
-            );
+            if crate::sync::scan_is_outdated(&cursor) {
+                log::info!(
+                    "the last scan used an older conversation mapping (version {} < {}); rescanning iCloud messages once",
+                    cursor.scan_version,
+                    crate::sync::SCAN_VERSION
+                );
+            } else {
+                log::info!(
+                    "history window is now {:?}, wider than the last scan stored; rescanning iCloud messages",
+                    bubbles_config.import_history
+                );
+            }
             crate::sync::reset_message_scan(&mut cursor);
             if let Err(e) = crate::sync::write_cursor(&dir, &cursor) {
                 log::warn!("cannot persist sync cursor: {e}");
@@ -1933,6 +1982,9 @@ impl Backend for RustpushBackend {
             ),
         }
         let chat_map = crate::sync::chat_lookup_map(&chat_cache);
+        if force {
+            log_message_chat_ids(&fetcher, &chat_map, &chat_cache).await;
+        }
 
         if !cursor.messages_complete {
             match fetcher.client.count_records().await {

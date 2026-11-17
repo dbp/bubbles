@@ -460,13 +460,18 @@ fn insert_tapback(c: &Connection, t: &Tapback) -> rusqlite::Result<()> {
     bump_chat_date(c, chat_id, t.date)
 }
 
-/// Move a message out of a chat the pre-fix cloud sync could not key
-/// properly. That sync stored a lone bare sender (`+12345`), or the literal
-/// `unknown-…` placeholder, as the whole participant set, so its messages
-/// never matched the chats the push path creates. When the same guid arrives
-/// again under a properly keyed chat, carry it over and drop the placeholder
-/// once nothing is left in it. Never moves a message *into* a placeholder,
-/// and never touches a chat that was keyed correctly.
+/// Move a message out of a chat an earlier cloud sync filed it in wrongly,
+/// when the same guid arrives again under a better chat:
+///
+/// * A placeholder: that sync stored a lone bare sender (`+12345`), or the
+///   literal `unknown-…` placeholder, as the whole participant set, so its
+///   messages never matched the chats the push path creates.
+/// * The sender's 1:1, for a message that belongs to a group: that sync
+///   couldn't resolve a group's id, so it filed group messages under the
+///   sender (see [`misfiled_from_one_to_one`]).
+///
+/// The old chat is dropped once nothing is left in it. Never moves a message
+/// *into* a placeholder, and never out of a chat that was keyed correctly.
 fn relocate_from_placeholder(c: &Connection, guid: &str, new_chat_id: i64) -> rusqlite::Result<()> {
     let existing: Option<(i64, String)> = c
         .query_row(
@@ -480,7 +485,10 @@ fn relocate_from_placeholder(c: &Connection, guid: &str, new_chat_id: i64) -> ru
     let Some((old_chat_id, old_key)) = existing else {
         return Ok(());
     };
-    if old_chat_id == new_chat_id || !is_placeholder_key(&old_key) {
+    if old_chat_id == new_chat_id {
+        return Ok(());
+    }
+    if !is_placeholder_key(&old_key) && !misfiled_from_one_to_one(c, old_chat_id, new_chat_id)? {
         return Ok(());
     }
     let new_key: String = c.query_row(
@@ -518,6 +526,32 @@ fn relocate_from_placeholder(c: &Connection, guid: &str, new_chat_id: i64) -> ru
 /// the `;`-joined normalised participant set, and a real conversation always
 /// carries our own handle plus at least one IDS URI, so a lone participant, an
 /// `unknown-…` placeholder, or a bare (non-URI) phone/email marks a fallback.
+/// True when a message stored in `old_chat` (not a group) arrives again
+/// under `new_chat` (a group) whose members include everyone in the old one:
+/// the old chat is the sender's 1:1 (or just us, for our own message) that
+/// the message was filed under when its group couldn't be resolved. Every
+/// member of a 1:1 being in the group is what makes the move safe; a 1:1
+/// with someone outside the group is left alone.
+fn misfiled_from_one_to_one(c: &Connection, old_chat: i64, new_chat: i64) -> rusqlite::Result<bool> {
+    let (old_is_group, new_is_group): (i64, i64) = c.query_row(
+        "SELECT (SELECT is_group FROM chat WHERE id = ?1),
+                (SELECT is_group FROM chat WHERE id = ?2)",
+        params![old_chat, new_chat],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    if old_is_group != 0 || new_is_group == 0 {
+        return Ok(false);
+    }
+    let outside_group: i64 = c.query_row(
+        "SELECT COUNT(*) FROM chat_participant
+         WHERE chat_id = ?1
+           AND handle_id NOT IN (SELECT handle_id FROM chat_participant WHERE chat_id = ?2)",
+        params![old_chat, new_chat],
+        |r| r.get(0),
+    )?;
+    Ok(outside_group == 0)
+}
+
 fn is_placeholder_key(key: &str) -> bool {
     let parts: Vec<&str> = key.split(';').filter(|p| !p.is_empty()).collect();
     parts.len() < 2
@@ -1581,6 +1615,64 @@ mod tests {
             .map(|m| m.guid)
             .collect();
         assert!(still.contains(&"G-BARE".to_string()), "never move out of a properly keyed chat");
+    }
+
+    /// Pin: group messages an earlier cloud sync filed under the sender's
+    /// 1:1 (or under just us, for our own) move into the group when the same
+    /// guid arrives again under it. The 1:1 keeps its real messages, an
+    /// emptied one disappears, and a 1:1 with someone outside the group is
+    /// never emptied into it.
+    #[test]
+    fn duplicate_guid_moves_from_the_senders_one_to_one_into_its_group() {
+        let mut c = db();
+        let chat = |participants: &[&str]| ChatRef {
+            participants: participants.iter().map(|p| p.to_string()).collect(),
+            display_name: None,
+            service: Some("iMessage".into()),
+        };
+        let me = "mailto:me@icloud.com";
+        let alice_1to1 = chat(&["tel:+12345", me]);
+        let bob_1to1 = chat(&["tel:+67890", me]);
+        let stranger_1to1 = chat(&["tel:+55555", me]);
+        let group = chat(&["tel:+12345", "tel:+67890", me]);
+        let message = |guid: &str, chat: &ChatRef, date: i64| IncomingMessage {
+            guid: guid.into(),
+            chat: chat.clone(),
+            sender: Some("tel:+12345".into()),
+            is_from_me: false,
+            text: Some("hi".into()),
+            date,
+            ..Default::default()
+        };
+
+        // The old sync: two group messages under Alice's 1:1, next to a real
+        // 1:1 message; one under Bob's 1:1 alone; one under a stranger's.
+        apply_blocking(&mut c, Ingest::Message(message("ALICE-REAL", &alice_1to1, 1000))).unwrap();
+        apply_blocking(&mut c, Ingest::Message(message("GRP-1", &alice_1to1, 2000))).unwrap();
+        apply_blocking(&mut c, Ingest::Message(message("GRP-2", &alice_1to1, 3000))).unwrap();
+        apply_blocking(&mut c, Ingest::Message(message("GRP-3", &bob_1to1, 4000))).unwrap();
+        apply_blocking(&mut c, Ingest::Message(message("ODD", &stranger_1to1, 5000))).unwrap();
+
+        // The fixed sync re-delivers the group messages under the group.
+        for (guid, date) in [("GRP-1", 2000), ("GRP-2", 3000), ("GRP-3", 4000), ("ODD", 5000)] {
+            apply_blocking(&mut c, Ingest::Message(message(guid, &group, date))).unwrap();
+        }
+
+        let chats = query_chats(&c).unwrap();
+        let guids_in = |key: String| -> Vec<String> {
+            let id = chats.iter().find(|ch| ch.key == key).map(|ch| ch.id);
+            id.map(|id| query_messages(&c, id).unwrap().into_iter().map(|m| m.guid).collect())
+                .unwrap_or_default()
+        };
+        assert_eq!(guids_in(group.key()), vec!["GRP-1", "GRP-2", "GRP-3"]);
+        assert_eq!(guids_in(alice_1to1.key()), vec!["ALICE-REAL"], "the real 1:1 message stays");
+        let alice = chats.iter().find(|ch| ch.key == alice_1to1.key()).unwrap();
+        assert_eq!(alice.last_message_date, Some(1000), "1:1 date recomputed after the move");
+        assert!(
+            !chats.iter().any(|ch| ch.key == bob_1to1.key()),
+            "an emptied 1:1 is dropped"
+        );
+        assert_eq!(guids_in(stranger_1to1.key()), vec!["ODD"], "someone outside the group: left alone");
     }
 
     /// Pin: a re-delivered guid whose text changed (an edit or unsend synced

@@ -155,6 +155,71 @@ fn parse_chat_id(chat_id: &str) -> Option<(&str, &str, &str)> {
     Some((service, kind, ident))
 }
 
+/// The shape of a chat identifier, never the identifier itself
+/// (`iMessage;+;chatN`, `phone`, `uuid`, ...), for diagnosing why a message
+/// doesn't resolve to its conversation.
+pub fn chat_id_shape(id: &str) -> String {
+    match parse_chat_id(id) {
+        Some((service, kind, rest)) => {
+            let service = match service {
+                "iMessage" | "SMS" | "RCS" | "any" => service,
+                _ => "other",
+            };
+            format!("{service};{kind};{}", identifier_shape(rest))
+        }
+        None => identifier_shape(id),
+    }
+}
+
+fn identifier_shape(s: &str) -> String {
+    let hex_dash = |c: char| c.is_ascii_hexdigit() || c == '-';
+    if s.is_empty() {
+        "empty".into()
+    } else if s.len() == 36 && s.chars().all(hex_dash) && s.matches('-').count() == 4 {
+        "uuid".into()
+    } else if s.strip_prefix("chat").is_some_and(|d| !d.is_empty() && d.chars().all(|c| c.is_ascii_digit())) {
+        "chatN".into()
+    } else if s.strip_prefix('+').unwrap_or(s).chars().all(|c| c.is_ascii_digit()) {
+        "phone".into()
+    } else if s.contains('@') {
+        "email".into()
+    } else if s.chars().all(|c| c.is_ascii_hexdigit()) {
+        format!("hex{}", s.len())
+    } else {
+        format!("other{}", s.len())
+    }
+}
+
+/// Which identifier of a cached chat a message's `chat_id` equals, and
+/// whether that chat is a group (style 43), for diagnostics. `"lookup"` is
+/// what `chat_ref_for` already finds; anything else is a chat it misses.
+pub fn chat_id_match(
+    chat_id: &str,
+    chat_map: &HashMap<String, CloudChat>,
+    cache: &CloudChatCache,
+) -> (&'static str, Option<bool>) {
+    if let Some(chat) = lookup_chat(chat_map, chat_id) {
+        return ("lookup", Some(chat.style == 43));
+    }
+    let bare = parse_chat_id(chat_id).map_or(chat_id, |(_, _, id)| id);
+    let same = |a: &str| !a.is_empty() && a.eq_ignore_ascii_case(bare);
+    for chat in cache.values() {
+        let hit = if same(&chat.chat_identifier) {
+            "chat_identifier"
+        } else if same(&chat.group_id) {
+            "group_id"
+        } else if same(&chat.original_group_id) {
+            "original_group_id"
+        } else if parse_chat_id(&chat.guid).is_some_and(|(_, _, g)| same(g)) {
+            "guid identifier"
+        } else {
+            continue;
+        };
+        return (hit, Some(chat.style == 43));
+    }
+    ("none", None)
+}
+
 /// Build a [`ChatRef`] whose key matches what the push path produces for the
 /// same conversation.
 ///
@@ -178,7 +243,7 @@ fn chat_ref_for(
     let mut participants: Vec<String> = Vec::new();
     let mut display_name = None;
 
-    if let Some(cloud_chat) = chat_map.get(chat_id) {
+    if let Some(cloud_chat) = lookup_chat(chat_map, chat_id) {
         // `ptcpts` lists the other members, like chat.db; we get added below
         // through the handle the chat was last addressed from.
         participants.extend(
@@ -410,9 +475,31 @@ fn chat_map_keys(record_id: &str, chat: &CloudChat) -> Vec<String> {
         let kind = if chat.style == 43 { "+" } else { "-" };
         keys.push(format!("{};{kind};{}", chat.service_name, chat.chat_identifier));
     }
+    // Group messages name their chat by the group's id, a bare UUID (seen
+    // on every group record in a real account), not by the compound guid.
+    if !chat.group_id.is_empty() {
+        keys.push(uuid_key(&chat.group_id));
+    }
     keys.sort();
     keys.dedup();
     keys
+}
+
+/// A chat's id from before a fork; looked up only when no chat currently
+/// has that id, so it never takes a live group's messages.
+fn chat_map_fallback_keys(chat: &CloudChat) -> Option<String> {
+    (!chat.original_group_id.is_empty()).then(|| uuid_key(&chat.original_group_id))
+}
+
+/// UUIDs compare without regard to case.
+fn uuid_key(id: &str) -> String {
+    id.to_ascii_uppercase()
+}
+
+/// The chat-zone record a message's `chat_id` names: by exact key, or as a
+/// UUID in either case.
+fn lookup_chat<'a>(chat_map: &'a HashMap<String, CloudChat>, chat_id: &str) -> Option<&'a CloudChat> {
+    chat_map.get(chat_id).or_else(|| chat_map.get(&uuid_key(chat_id)))
 }
 
 /// Summary of a single `sync_once` session.
@@ -2012,6 +2099,7 @@ mod tests {
             records_scanned: 500,
             last_scan_total: 500,
             stored_since_ms,
+            scan_version: SCAN_VERSION,
             ..SyncCursor::default()
         }
     }
@@ -2043,6 +2131,31 @@ mod tests {
         assert!(needs_rescan(&legacy, HistoryWindow::Days(30), now));
         // A first run has nothing to redo.
         assert!(!needs_rescan(&SyncCursor::default(), HistoryWindow::Everything, now));
+    }
+
+    /// Pin: a scan made before group messages were keyed by group id is
+    /// redone once, whatever the window, so misfiled messages move; once
+    /// redone it isn't again.
+    #[test]
+    fn an_outdated_scan_is_redone_once() {
+        let now = 1_000 * DAY_MS;
+        let mut old = scanned_cursor(Some(i64::MIN));
+        old.scan_version = 0;
+        assert!(scan_is_outdated(&old));
+        assert!(needs_rescan(&old, HistoryWindow::Everything, now));
+        assert!(needs_rescan(&scanned_cursor_v0_default(), HistoryWindow::DEFAULT, now));
+
+        reset_message_scan(&mut old);
+        assert!(!needs_rescan(&old, HistoryWindow::Everything, now), "a reset scan starts fresh");
+        begin_scan_window(&mut old, HistoryWindow::Everything, now);
+        assert_eq!(old.scan_version, SCAN_VERSION);
+        old.messages_token = Some(plist::Data::new(vec![1]));
+        old.messages_complete = true;
+        assert!(!needs_rescan(&old, HistoryWindow::Everything, now));
+    }
+
+    fn scanned_cursor_v0_default() -> SyncCursor {
+        SyncCursor { scan_version: 0, ..scanned_cursor(None) }
     }
 
     #[test]
@@ -2414,6 +2527,137 @@ mod chat_mapping_tests {
     }
 
     #[test]
+    fn chat_id_shapes_hide_the_identifier() {
+        assert_eq!(chat_id_shape("iMessage;+;chat123456789"), "iMessage;+;chatN");
+        assert_eq!(chat_id_shape("SMS;-;+14015550100"), "SMS;-;phone");
+        assert_eq!(chat_id_shape("any;-;alice@example.com"), "any;-;email");
+        assert_eq!(chat_id_shape("chat987"), "chatN");
+        assert_eq!(chat_id_shape("1B4E28BA-2FA1-11D2-883F-0016D3CCA427"), "uuid");
+        assert_eq!(chat_id_shape("0a1b2c3d4e5f60718293a4b5c6d7e8f9"), "hex32");
+        assert_eq!(chat_id_shape("Weekend crew"), "other12");
+        assert_eq!(chat_id_shape("weird;x;"), "other8");
+        assert_eq!(chat_id_shape(""), "empty");
+    }
+
+    #[test]
+    fn chat_id_match_names_the_identifier_that_matched() {
+        let mut cache = CloudChatCache::new();
+        cache.insert(
+            "rec-g".into(),
+            CloudChat {
+                style: 43,
+                chat_identifier: "chat111".into(),
+                group_id: "AAAAAAAA-0000-0000-0000-000000000001".into(),
+                original_group_id: "BBBBBBBB-0000-0000-0000-000000000002".into(),
+                guid: "iMessage;+;chat111".into(),
+                service_name: "iMessage".into(),
+                ..Default::default()
+            },
+        );
+        let map = chat_lookup_map(&cache);
+        assert_eq!(chat_id_match("iMessage;+;chat111", &map, &cache), ("lookup", Some(true)));
+        assert_eq!(chat_id_match("rec-g", &map, &cache), ("lookup", Some(true)));
+        assert_eq!(chat_id_match("chat111", &map, &cache), ("chat_identifier", Some(true)));
+        assert_eq!(chat_id_match("any;+;chat111", &map, &cache), ("chat_identifier", Some(true)));
+        // Group ids, current and former, are lookup keys now; the matcher
+        // still names them when given a map without them.
+        assert_eq!(
+            chat_id_match("aaaaaaaa-0000-0000-0000-000000000001", &map, &cache),
+            ("lookup", Some(true))
+        );
+        assert_eq!(
+            chat_id_match("BBBBBBBB-0000-0000-0000-000000000002", &map, &cache),
+            ("lookup", Some(true))
+        );
+        let empty = HashMap::new();
+        assert_eq!(
+            chat_id_match("aaaaaaaa-0000-0000-0000-000000000001", &empty, &cache),
+            ("group_id", Some(true))
+        );
+        assert_eq!(
+            chat_id_match("BBBBBBBB-0000-0000-0000-000000000002", &empty, &cache),
+            ("original_group_id", Some(true))
+        );
+        assert_eq!(chat_id_match("chat222", &map, &cache), ("none", None));
+    }
+
+    fn group_chat(group_id: &str, original_group_id: &str, members: &[&str], name: &str) -> CloudChat {
+        CloudChat {
+            style: 43,
+            group_id: group_id.into(),
+            original_group_id: original_group_id.into(),
+            participants: members.iter().map(|m| CloudParticipant { uri: m.to_string() }).collect(),
+            last_addressed_handle: "me@icloud.com".into(),
+            display_name: Some(name.into()),
+            ..Default::default()
+        }
+    }
+
+    /// Pin: the real-world bug. Group messages carry the group's id, a bare
+    /// UUID, as their `chat_id`; they used to fall through to a 1:1 with the
+    /// sender. They resolve to the group, in either case.
+    #[test]
+    fn group_message_keyed_by_group_id_lands_in_the_group() {
+        let mut cache = CloudChatCache::new();
+        cache.insert(
+            "rec-g".into(),
+            group_chat("AAAAAAAA-0000-0000-0000-000000000001", "", &["+12345", "+67890"], "Crew"),
+        );
+        let map = chat_lookup_map(&cache);
+        for chat_id in ["AAAAAAAA-0000-0000-0000-000000000001", "aaaaaaaa-0000-0000-0000-000000000001"] {
+            let m = message(cloud_message_to_ingest(
+                cm("g7", chat_id, "+12345", "me@icloud.com", MessageFlags::IS_FINISHED),
+                &[],
+                &map,
+            ));
+            assert!(m.chat.is_group(), "{chat_id}: got {:?}", m.chat.participants);
+            assert_eq!(
+                m.chat.key(),
+                push_key(&["tel:+12345", "tel:+67890", "mailto:me@icloud.com"])
+            );
+            assert_eq!(m.chat.display_name.as_deref(), Some("Crew"));
+        }
+        // Our own message in the group (empty sender) lands there too.
+        let own = message(cloud_message_to_ingest(
+            cm("g8", "AAAAAAAA-0000-0000-0000-000000000001", "", "me@icloud.com", MessageFlags::IS_FROM_ME),
+            &[],
+            &map,
+        ));
+        assert!(own.chat.is_group());
+    }
+
+    /// Pin: a former group id finds the group that came from it, but never
+    /// takes the messages of a group that has that id now.
+    #[test]
+    fn original_group_id_is_a_fallback_only() {
+        let mut cache = CloudChatCache::new();
+        cache.insert(
+            "rec-new".into(),
+            group_chat("NEW00000-0000-0000-0000-000000000002", "OLD00000-0000-0000-0000-000000000001", &["+1", "+2"], "Forked"),
+        );
+        let map = chat_lookup_map(&cache);
+        let old = message(cloud_message_to_ingest(
+            cm("g9", "OLD00000-0000-0000-0000-000000000001", "+1", "me@icloud.com", MessageFlags::IS_FINISHED),
+            &[],
+            &map,
+        ));
+        assert_eq!(old.chat.display_name.as_deref(), Some("Forked"));
+
+        // Another group whose current id is that former id keeps its messages.
+        cache.insert(
+            "rec-live".into(),
+            group_chat("OLD00000-0000-0000-0000-000000000001", "", &["+3", "+4"], "Live"),
+        );
+        let map = chat_lookup_map(&cache);
+        let live = message(cloud_message_to_ingest(
+            cm("g10", "OLD00000-0000-0000-0000-000000000001", "+3", "me@icloud.com", MessageFlags::IS_FINISHED),
+            &[],
+            &map,
+        ));
+        assert_eq!(live.chat.display_name.as_deref(), Some("Live"));
+    }
+
+    #[test]
     fn my_handles_mark_from_me_even_without_the_flag() {
         let m = message(cloud_message_to_ingest(
             cm("g6", "iMessage;-;+12345", "me@icloud.com", "me@icloud.com", MessageFlags::IS_FINISHED),
@@ -2544,17 +2788,36 @@ pub struct SyncCursor {
     /// all stored [`HistoryWindow::DEFAULT`].
     #[serde(default)]
     pub stored_since_ms: Option<i64>,
+    /// The [`SCAN_VERSION`] the initial scan ran with; 0 for scans made
+    /// before this was recorded.
+    #[serde(default)]
+    pub scan_version: u32,
 }
 
-/// Whether the history window now asks for older messages than the initial
-/// scan stored, so the message zone has to be walked again from the start.
-/// A scan that hasn't started will use the new window anyway. Leeway of a
-/// day keeps a "last 30 days" window, which moves forward daily, from
+/// Bumped when the initial scan files records differently enough that a
+/// finished scan must be redone once so stored messages move to the right
+/// conversation. 1: group messages keyed by group id (before, they were
+/// filed under the sender's 1:1).
+pub const SCAN_VERSION: u32 = 1;
+
+/// The initial scan ran with an older [`SCAN_VERSION`].
+pub fn scan_is_outdated(cursor: &SyncCursor) -> bool {
+    let started = cursor.messages_complete || cursor.messages_token.is_some();
+    started && cursor.scan_version < SCAN_VERSION
+}
+
+/// Whether the message zone has to be walked again from the start: the scan
+/// is outdated, or the history window now asks for older messages than it
+/// stored. A scan that hasn't started will use the new window anyway. Leeway
+/// of a day keeps a "last 30 days" window, which moves forward daily, from
 /// rescanning every day.
 pub fn needs_rescan(cursor: &SyncCursor, window: HistoryWindow, now_ms: i64) -> bool {
     let started = cursor.messages_complete || cursor.messages_token.is_some();
     if !started {
         return false;
+    }
+    if scan_is_outdated(cursor) {
+        return true;
     }
     match cursor.stored_since_ms {
         Some(stored) => window.since_ms(now_ms) < stored.saturating_sub(DAY_MS),
@@ -2585,6 +2848,7 @@ pub fn begin_scan_window(cursor: &mut SyncCursor, window: HistoryWindow, now_ms:
         _ => wanted,
     };
     cursor.stored_since_ms = Some(since);
+    cursor.scan_version = SCAN_VERSION;
     since
 }
 
@@ -2667,6 +2931,12 @@ pub fn chat_lookup_map(cache: &CloudChatCache) -> HashMap<String, CloudChat> {
     for (record_id, chat) in cache {
         for key in chat_map_keys(record_id, chat) {
             map.insert(key, chat.clone());
+        }
+    }
+    // Second, so a current id always wins over another chat's former one.
+    for chat in cache.values() {
+        if let Some(key) = chat_map_fallback_keys(chat) {
+            map.entry(key).or_insert_with(|| chat.clone());
         }
     }
     map
@@ -2987,6 +3257,7 @@ mod cursor_sync_tests {
             last_scan_total: 7,
             account_dsid: None,
             stored_since_ms: None,
+            scan_version: 0,
         };
         write_cursor(tmp.path(), &cursor).unwrap();
         let back = read_cursor(tmp.path());
