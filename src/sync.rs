@@ -646,16 +646,67 @@ pub const LAST_SYNC_ERROR_FILENAME: &str = "last_sync_error";
 /// Default backoff period: 24 hours in seconds.
 pub const DEFAULT_BACKOFF_SECS: u64 = 24 * 60 * 60;
 
-/// Simple `key=value` config file at `<state_dir>/config`.
-/// Currently has one setting: `cloud_sync_enabled`.
-/// Default is `true` (sync enabled) if the file is missing or the value
-/// is missing/invalid.
+/// Simple `key=value` config file at `<state_dir>/config`: the cloud sync
+/// preferences. A missing file, key or invalid value means that setting's
+/// default.
 pub struct BubblesConfig {
     pub cloud_sync_enabled: bool,
     /// When true, cloud sync only stores messages for conversations already
     /// in the sidebar. A conversation deleted here, or a number that only
     /// ever reached the phone, stays out until a message arrives live.
     pub sync_existing_chats_only: bool,
+    /// How far back the initial iCloud scan stores messages.
+    pub import_history: HistoryWindow,
+}
+
+const DAY_MS: i64 = 24 * 60 * 60 * 1000;
+
+/// How far back the initial iCloud scan stores messages. The scan reads the
+/// whole message zone either way (so its token ends up meaning "now"); this
+/// only decides which of those records are kept.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HistoryWindow {
+    Days(u32),
+    Everything,
+}
+
+impl HistoryWindow {
+    /// What bubbles always did: the last two days.
+    pub const DEFAULT: Self = Self::Days(2);
+    /// The choices offered in Settings, in display order.
+    pub const CHOICES: [Self; 4] = [Self::Days(2), Self::Days(30), Self::Days(365), Self::Everything];
+
+    pub fn label(self) -> String {
+        match self {
+            Self::Days(2) => "Last 2 days".to_owned(),
+            Self::Days(30) => "Last 30 days".to_owned(),
+            Self::Days(365) => "Last year".to_owned(),
+            Self::Days(d) => format!("Last {d} days"),
+            Self::Everything => "Everything".to_owned(),
+        }
+    }
+
+    /// Unix ms of the oldest message to store, as of `now_ms`.
+    pub fn since_ms(self, now_ms: i64) -> i64 {
+        match self {
+            Self::Days(d) => now_ms.saturating_sub(i64::from(d) * DAY_MS),
+            Self::Everything => i64::MIN,
+        }
+    }
+
+    fn to_config(self) -> String {
+        match self {
+            Self::Days(d) => d.to_string(),
+            Self::Everything => "all".to_owned(),
+        }
+    }
+
+    fn from_config(value: &str) -> Option<Self> {
+        match value {
+            "all" => Some(Self::Everything),
+            days => days.parse().ok().filter(|d| *d > 0).map(Self::Days),
+        }
+    }
 }
 
 impl BubblesConfig {
@@ -671,6 +722,7 @@ impl BubblesConfig {
             // Off by default: sync mirrors iCloud unless the user asks
             // otherwise.
             sync_existing_chats_only: false,
+            import_history: HistoryWindow::DEFAULT,
         }
     }
 }
@@ -695,6 +747,11 @@ pub fn read_config(path: &Path) -> BubblesConfig {
             match key {
                 "cloud_sync_enabled" => config.cloud_sync_enabled = enabled,
                 "sync_existing_chats_only" => config.sync_existing_chats_only = enabled,
+                "import_history" => {
+                    if let Some(window) = HistoryWindow::from_config(value) {
+                        config.import_history = window;
+                    }
+                }
                 // Other keys are ignored (forward-compat).
                 _ => {}
             }
@@ -707,8 +764,10 @@ pub fn read_config(path: &Path) -> BubblesConfig {
 /// Write the config to `path`. Overwrites existing file.
 pub fn write_config(path: &Path, config: &BubblesConfig) -> io::Result<()> {
     let contents = format!(
-        "cloud_sync_enabled={}\nsync_existing_chats_only={}\n",
-        config.cloud_sync_enabled, config.sync_existing_chats_only
+        "cloud_sync_enabled={}\nsync_existing_chats_only={}\nimport_history={}\n",
+        config.cloud_sync_enabled,
+        config.sync_existing_chats_only,
+        config.import_history.to_config()
     );
     fs::write(path, contents)
 }
@@ -1906,6 +1965,7 @@ mod tests {
         let config = BubblesConfig {
             cloud_sync_enabled: true,
             sync_existing_chats_only: true,
+            import_history: HistoryWindow::DEFAULT,
         };
         write_config(&path, &config).unwrap();
         let loaded = read_config(&path);
@@ -1916,6 +1976,124 @@ mod tests {
         let legacy = read_config(&path);
         assert!(legacy.cloud_sync_enabled);
         assert!(!legacy.sync_existing_chats_only);
+        assert_eq!(legacy.import_history, HistoryWindow::DEFAULT);
+    }
+
+    /// Pin: every Settings choice round-trips, and a bad value keeps the
+    /// default instead of failing the whole file.
+    #[test]
+    fn config_import_history_round_trips() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join(CONFIG_FILENAME);
+        for window in HistoryWindow::CHOICES {
+            let config = BubblesConfig { import_history: window, ..BubblesConfig::default() };
+            write_config(&path, &config).unwrap();
+            assert_eq!(read_config(&path).import_history, window);
+        }
+        for bad in ["0", "-3", "lots", ""] {
+            std::fs::write(&path, format!("import_history={bad}\n")).unwrap();
+            assert_eq!(read_config(&path).import_history, HistoryWindow::DEFAULT, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn history_window_since() {
+        let now = 1_000 * DAY_MS;
+        assert_eq!(HistoryWindow::Days(2).since_ms(now), now - 2 * DAY_MS);
+        assert_eq!(HistoryWindow::Days(365).since_ms(now), now - 365 * DAY_MS);
+        assert_eq!(HistoryWindow::Everything.since_ms(now), i64::MIN);
+        assert_eq!(HistoryWindow::Days(30).label(), "Last 30 days");
+    }
+
+    fn scanned_cursor(stored_since_ms: Option<i64>) -> SyncCursor {
+        SyncCursor {
+            messages_token: Some(plist::Data::new(vec![1, 2, 3])),
+            messages_complete: true,
+            records_scanned: 500,
+            last_scan_total: 500,
+            stored_since_ms,
+            ..SyncCursor::default()
+        }
+    }
+
+    /// Pin: widening the window rescans; the same window a day or a month
+    /// later doesn't, and neither does narrowing it.
+    #[test]
+    fn rescan_only_when_the_window_widens() {
+        let now = 1_000 * DAY_MS;
+        let thirty = scanned_cursor(Some(HistoryWindow::Days(30).since_ms(now)));
+        assert!(!needs_rescan(&thirty, HistoryWindow::Days(30), now));
+        assert!(!needs_rescan(&thirty, HistoryWindow::Days(30), now + 31 * DAY_MS));
+        assert!(!needs_rescan(&thirty, HistoryWindow::Days(2), now));
+        assert!(needs_rescan(&thirty, HistoryWindow::Days(365), now));
+        assert!(needs_rescan(&thirty, HistoryWindow::Everything, now));
+
+        let everything = scanned_cursor(Some(i64::MIN));
+        assert!(!needs_rescan(&everything, HistoryWindow::Everything, now));
+        assert!(!needs_rescan(&everything, HistoryWindow::Days(365), now));
+    }
+
+    /// Pin: a scan finished before the window was recorded stored two days,
+    /// so upgrading alone doesn't rescan, but asking for more does.
+    #[test]
+    fn rescan_of_a_scan_from_before_the_setting() {
+        let now = 1_000 * DAY_MS;
+        let legacy = scanned_cursor(None);
+        assert!(!needs_rescan(&legacy, HistoryWindow::DEFAULT, now));
+        assert!(needs_rescan(&legacy, HistoryWindow::Days(30), now));
+        // A first run has nothing to redo.
+        assert!(!needs_rescan(&SyncCursor::default(), HistoryWindow::Everything, now));
+    }
+
+    #[test]
+    fn reset_starts_the_message_scan_over_and_keeps_the_rest() {
+        let mut cursor = scanned_cursor(Some(0));
+        cursor.chats_token = Some(plist::Data::new(vec![9]));
+        cursor.chats_complete = true;
+        cursor.account_dsid = Some("123".into());
+        reset_message_scan(&mut cursor);
+        assert!(cursor.messages_token.is_none() && !cursor.messages_complete);
+        assert_eq!((cursor.records_scanned, cursor.stored_since_ms), (0, None));
+        assert_eq!(cursor.last_scan_total, 500);
+        assert!(cursor.chats_complete && cursor.chats_token.is_some());
+        assert_eq!(cursor.account_dsid.as_deref(), Some("123"));
+    }
+
+    /// Pin: a fresh scan records its window; a resumed one keeps the
+    /// earliest of then and now; a finished one changes nothing.
+    #[test]
+    fn scan_window_is_recorded_and_kept_on_resume() {
+        let now = 1_000 * DAY_MS;
+        let mut fresh = SyncCursor::default();
+        let since = begin_scan_window(&mut fresh, HistoryWindow::Days(30), now);
+        assert_eq!(since, now - 30 * DAY_MS);
+        assert_eq!(fresh.stored_since_ms, Some(since));
+
+        // Resumed two days later: still from the original start.
+        fresh.messages_token = Some(plist::Data::new(vec![1]));
+        let resumed = begin_scan_window(&mut fresh, HistoryWindow::Days(30), now + 2 * DAY_MS);
+        assert_eq!(resumed, since);
+
+        let mut done = scanned_cursor(Some(since));
+        begin_scan_window(&mut done, HistoryWindow::Everything, now);
+        assert_eq!(done.stored_since_ms, Some(since));
+    }
+
+    /// Pin: a cursor file from before `stored_since_ms` existed still loads.
+    #[test]
+    fn cursor_without_stored_since_loads() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut cursor = scanned_cursor(Some(5));
+        write_cursor(tmp.path(), &cursor).unwrap();
+        assert_eq!(read_cursor(tmp.path()).stored_since_ms, Some(5));
+
+        // Written the way older builds wrote it: no such key at all.
+        cursor.stored_since_ms = None;
+        let mut legacy = Vec::new();
+        plist::to_writer_xml(&mut legacy, &cursor).unwrap();
+        assert!(!String::from_utf8_lossy(&legacy).contains("stored_since_ms"));
+        let parsed: SyncCursor = plist::from_bytes(&legacy).unwrap();
+        assert!(parsed.messages_complete && parsed.stored_since_ms.is_none());
     }
 
     #[test]
@@ -2361,6 +2539,53 @@ pub struct SyncCursor {
     /// from scratch rather than fail every sync with someone else's token.
     #[serde(default)]
     pub account_dsid: Option<String>,
+    /// Unix ms of the oldest message the initial scan stores (set when the
+    /// scan starts). `None` for scans made before this was recorded, which
+    /// all stored [`HistoryWindow::DEFAULT`].
+    #[serde(default)]
+    pub stored_since_ms: Option<i64>,
+}
+
+/// Whether the history window now asks for older messages than the initial
+/// scan stored, so the message zone has to be walked again from the start.
+/// A scan that hasn't started will use the new window anyway. Leeway of a
+/// day keeps a "last 30 days" window, which moves forward daily, from
+/// rescanning every day.
+pub fn needs_rescan(cursor: &SyncCursor, window: HistoryWindow, now_ms: i64) -> bool {
+    let started = cursor.messages_complete || cursor.messages_token.is_some();
+    if !started {
+        return false;
+    }
+    match cursor.stored_since_ms {
+        Some(stored) => window.since_ms(now_ms) < stored.saturating_sub(DAY_MS),
+        None => window != HistoryWindow::DEFAULT,
+    }
+}
+
+/// Starts the message-zone scan over. The chat zone, the account and the
+/// last scan's size (the progress estimate) are kept.
+pub fn reset_message_scan(cursor: &mut SyncCursor) {
+    cursor.messages_token = None;
+    cursor.messages_complete = false;
+    cursor.records_scanned = 0;
+    cursor.stored_since_ms = None;
+}
+
+/// The since-time the scan should store from, recording it on a fresh scan.
+/// A resumed scan keeps the earliest of what it started with and the window
+/// now, so records already passed aren't held to a different window than
+/// the rest.
+pub fn begin_scan_window(cursor: &mut SyncCursor, window: HistoryWindow, now_ms: i64) -> i64 {
+    let wanted = window.since_ms(now_ms);
+    if cursor.messages_complete {
+        return wanted;
+    }
+    let since = match cursor.stored_since_ms {
+        Some(stored) if cursor.messages_token.is_some() => stored.min(wanted),
+        _ => wanted,
+    };
+    cursor.stored_since_ms = Some(since);
+    since
 }
 
 /// Ensure the persisted cursor and chat cache belong to `dsid`. On a
@@ -2761,6 +2986,7 @@ mod cursor_sync_tests {
             records_scanned: 42,
             last_scan_total: 7,
             account_dsid: None,
+            stored_since_ms: None,
         };
         write_cursor(tmp.path(), &cursor).unwrap();
         let back = read_cursor(tmp.path());

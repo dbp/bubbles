@@ -1893,6 +1893,22 @@ impl Backend for RustpushBackend {
         let mut cursor = crate::sync::read_cursor(&dir);
         let mut chat_cache = crate::sync::read_cloud_chats(&dir);
         crate::sync::ensure_cursor_account(&dir, &mut cursor, &mut chat_cache, &account_dsid);
+        let bubbles_config =
+            crate::sync::read_config(&dir.join(crate::sync::CONFIG_FILENAME));
+        let now_ms = now_ms();
+        // A wider history window than the initial scan stored: walk the
+        // message zone again. Messages already stored are matched by guid,
+        // so nothing is duplicated.
+        if crate::sync::needs_rescan(&cursor, bubbles_config.import_history, now_ms) {
+            log::info!(
+                "history window is now {:?}, wider than the last scan stored; rescanning iCloud messages",
+                bubbles_config.import_history
+            );
+            crate::sync::reset_message_scan(&mut cursor);
+            if let Err(e) = crate::sync::write_cursor(&dir, &cursor) {
+                log::warn!("cannot persist sync cursor: {e}");
+            }
+        }
         {
             let mut p = self.sync_progress.lock().unwrap();
             p.scanning = !cursor.messages_complete;
@@ -1948,16 +1964,18 @@ impl Backend for RustpushBackend {
             }
         }
 
-        // During the initial scan only the recent window is stored. Never let
-        // that window be narrower than 48 hours, even when the caller's
-        // cutoff (a recent last-alive stamp) is closer than that.
-        let now_ms = now_ms();
-        let apply_since_ms = cutoff_ms.min(now_ms - 48 * 60 * 60 * 1000);
+        // During the initial scan only the chosen history window is stored
+        // (recorded in the cursor, so widening it later can rescan). Never
+        // let it be narrower than 48 hours, or than the caller's cutoff (a
+        // last-alive stamp from a long time closed).
+        let window_since_ms =
+            crate::sync::begin_scan_window(&mut cursor, bubbles_config.import_history, now_ms);
+        let apply_since_ms = cutoff_ms
+            .min(window_since_ms)
+            .min(now_ms - 48 * 60 * 60 * 1000);
 
         // "Only sync existing conversations": snapshot the sidebar's chat
         // keys once per run and let the page processor drop anything else.
-        let bubbles_config =
-            crate::sync::read_config(&dir.join(crate::sync::CONFIG_FILENAME));
         let existing_chats: Option<std::collections::HashSet<String>> =
             if bubbles_config.sync_existing_chats_only {
                 match store.chats().await {

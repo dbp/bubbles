@@ -860,6 +860,43 @@ impl super::Ui {
                 }
             });
         }
+
+        // How far back the initial scan stores messages. Widening it rescans
+        // on the next sync (the backend compares it with what the last scan
+        // stored); narrowing it keeps what's already here.
+        {
+            let mut windows = crate::sync::HistoryWindow::CHOICES.to_vec();
+            // A value set by hand in the config file still shows as itself.
+            if !windows.contains(&initial_config.import_history) {
+                windows.push(initial_config.import_history);
+            }
+            let labels: Vec<String> = windows.iter().map(|w| w.label()).collect();
+            let label_refs: Vec<&str> = labels.iter().map(String::as_str).collect();
+            let selected = windows
+                .iter()
+                .position(|w| *w == initial_config.import_history)
+                .unwrap_or(0);
+            let history_row = adw::ComboRow::builder()
+                .title("Import history")
+                .subtitle("How far back cloud sync keeps messages from iCloud (text only). Choosing a longer range rescans your iCloud history on the next sync or Sync Now, which can take several minutes.")
+                .model(&gtk::StringList::new(&label_refs))
+                .selected(selected as u32)
+                .build();
+            let config_path = config_path.clone();
+            history_row.connect_selected_notify(move |row| {
+                let Some(&window) = windows.get(row.selected() as usize) else {
+                    return;
+                };
+                let mut new_config = crate::sync::read_config(&config_path);
+                new_config.import_history = window;
+                if let Err(e) = crate::sync::write_config(&config_path, &new_config) {
+                    log::warn!("failed to write config: {e}");
+                } else {
+                    log::info!("import_history set to {window:?}");
+                }
+            });
+            sync_group.add(&history_row);
+        }
         sync_group.add(&existing_only_switch);
 
         // Manual "Sync Now" button — forces a sync regardless of the
