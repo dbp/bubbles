@@ -31,6 +31,39 @@ impl super::Ui {
 
     /// Clear the pending attachment and hide the chip. Safe to call when
     /// nothing is pending.
+    /// Start replying to a message: the next send answers it, and the bar
+    /// above the entry says to whom.
+    pub(super) fn set_reply_target(&self, target: ReplyTarget) {
+        self.reply_chip_title
+            .set_text(&super::helpers::reply_banner_title(&target.who));
+        self.reply_chip_text.set_text(&target.snippet);
+        // The bar takes room from the timeline. If it was showing its newest
+        // message (replying to the latest is the common case), keep that in
+        // view once the layout settles, rather than cutting it off.
+        let adj = self.scroller.vadjustment();
+        if !self.reply_chip.is_visible() && adj.value() >= adj.upper() - adj.page_size() - 8.0 {
+            let pending: Rc<RefCell<Option<glib::SignalHandlerId>>> = Rc::new(RefCell::new(None));
+            let pending_in = pending.clone();
+            let id = adj.connect_changed(move |a| {
+                a.set_value((a.upper() - a.page_size()).max(0.0));
+                if let Some(id) = pending_in.borrow_mut().take() {
+                    a.disconnect(id);
+                }
+            });
+            *pending.borrow_mut() = Some(id);
+        }
+        self.reply_chip.set_visible(true);
+        *self.reply_target.borrow_mut() = Some(target);
+        self.entry.grab_focus();
+    }
+
+    pub(super) fn clear_reply_target(&self) {
+        self.reply_chip.set_visible(false);
+        self.reply_chip_title.set_text("");
+        self.reply_chip_text.set_text("");
+        *self.reply_target.borrow_mut() = None;
+    }
+
     pub(super) fn clear_pending_attachment(&self) {
         self.pending_chip.set_visible(false);
         self.pending_chip_label.set_text("");
@@ -305,6 +338,7 @@ impl super::Ui {
             let path_str = att.path.to_string_lossy().into_owned();
             let chat_ref = chat_ref_of(&chat);
             let guid = new_guid();
+            let reply = self.take_reply_target();
             let chat_id = chat.id;
             let is_group = chat.is_group;
             let text_for_msg = if text.is_empty() {
@@ -323,6 +357,8 @@ impl super::Ui {
                 service: Some("iMessage".into()),
                 date: now_ms(),
                 pending: true,
+                reply_to_guid: reply.as_ref().map(|r| r.guid.clone()),
+                reply_part: reply.as_ref().map(|r| r.part.clone()),
                 attachments: vec![AttachmentRecord {
                     guid: Some(format!("{guid}-0")),
                     mime: Some(att.mime.clone()),
@@ -361,7 +397,7 @@ impl super::Ui {
                                 .send_attachment(
                                     &client, &connection, &chat_ref, &my_handle, path_str,
                                     att.mime, att.name, if text.is_empty() { None } else { Some(text) },
-                                    guid,
+                                    guid, reply,
                                 )
                                 .await?;
                             Ok::<(), anyhow::Error>(())
@@ -413,10 +449,18 @@ impl super::Ui {
             return;
         };
         entry.set_text("");
-        self.send_text(&chat, text);
+        let reply = self.take_reply_target();
+        self.send_text(&chat, text, reply);
     }
 
-    fn send_text(&self, chat: &ChatSummary, text: String) {
+    /// The reply the next send answers, clearing the bar.
+    fn take_reply_target(&self) -> Option<crate::store::ReplyTo> {
+        let target = self.reply_target.borrow_mut().take();
+        self.clear_reply_target();
+        target.map(|t| t.to)
+    }
+
+    fn send_text(&self, chat: &ChatSummary, text: String, reply: Option<crate::store::ReplyTo>) {
         let Some(my_handle) = self_handle(&chat.participants, &self.handles) else {
             eprintln!("no self handle in chat; cannot send");
             return;
@@ -437,6 +481,8 @@ impl super::Ui {
             service: Some("iMessage".into()),
             date: now_ms(),
             pending: true,
+            reply_to_guid: reply.as_ref().map(|r| r.guid.clone()),
+            reply_part: reply.as_ref().map(|r| r.part.clone()),
             ..Default::default()
         };
 
@@ -463,7 +509,7 @@ impl super::Ui {
                 gtk_bridge::spawn(
                     async move {
                         backend
-                            .send_text(&client, &chat_ref, &my_handle, text, guid)
+                            .send_text(&client, &chat_ref, &my_handle, text, guid, reply)
                             .await?;
                         Ok::<(), anyhow::Error>(())
                     },
@@ -845,7 +891,7 @@ impl super::Ui {
                     gtk_bridge::spawn(
                         async move {
                             backend
-                                .send_text(&client, &chat_ref, &my_handle, text, guid2)
+                                .send_text(&client, &chat_ref, &my_handle, text, guid2, None)
                                 .await?;
                             Ok::<(), anyhow::Error>(())
                         },

@@ -383,6 +383,7 @@ pub trait Backend: Send + Sync {
         my_handle: &str,
         text: String,
         guid: String,
+        reply: Option<crate::store::ReplyTo>,
     ) -> Result<IncomingMessage>;
 
     /// Send a tapback (reaction) to a target message in `chat`.
@@ -428,6 +429,7 @@ pub trait Backend: Send + Sync {
         name: String,
         text: Option<String>,
         guid: String,
+        reply: Option<crate::store::ReplyTo>,
     ) -> Result<IncomingMessage>;
 
     /// Fire-and-forget a delivered (`read=false`) or read (`read=true`) receipt

@@ -27,6 +27,34 @@ pub(super) fn strip_marker(s: &str) -> String {
     s.replace('\u{FFFC}', "").trim().to_string()
 }
 
+/// Most characters of the original a reply quote or the "Replying to …" bar
+/// shows (the label also ellipsizes to fit).
+const REPLY_SNIPPET_CHARS: usize = 80;
+
+/// A one-line taste of the message a reply answers: its text on one line,
+/// cut to [`REPLY_SNIPPET_CHARS`], or what it was when it had no text.
+pub(super) fn reply_snippet(text: Option<&str>, has_attachments: bool) -> String {
+    let flat = text
+        .map(strip_marker)
+        .unwrap_or_default()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if flat.is_empty() {
+        return if has_attachments { "Attachment".into() } else { "Message".into() };
+    }
+    if flat.chars().count() <= REPLY_SNIPPET_CHARS {
+        return flat;
+    }
+    let cut: String = flat.chars().take(REPLY_SNIPPET_CHARS).collect();
+    format!("{}…", cut.trim_end())
+}
+
+/// The first line of the bar above the entry while composing a reply.
+pub(super) fn reply_banner_title(who: &str) -> String {
+    format!("Replying to {who}")
+}
+
 /// Guess a MIME type from a file extension. Returns `application/octet-stream`
 /// for unknown extensions.
 pub(super) fn guess_mime(name: &str) -> String {
@@ -268,6 +296,17 @@ pub(super) fn clear_box(b: &gtk::Box) {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    #[test]
+    fn reply_snippets_are_one_short_line() {
+        assert_eq!(reply_snippet(Some("see you\n\n  at noon "), false), "see you at noon");
+        assert_eq!(reply_snippet(Some("\u{FFFC}"), true), "Attachment");
+        assert_eq!(reply_snippet(None, false), "Message");
+        let long = "word ".repeat(40);
+        let s = reply_snippet(Some(&long), false);
+        assert!(s.ends_with('…') && s.chars().count() <= REPLY_SNIPPET_CHARS + 1, "{s:?}");
+        assert_eq!(reply_banner_title("Carol"), "Replying to Carol");
+    }
 
     #[test]
     fn parse_uri_list_single_file_uri_returns_one_path() {

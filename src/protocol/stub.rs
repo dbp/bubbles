@@ -172,6 +172,7 @@ impl Backend for StubBackend {
         my_handle: &str,
         text: String,
         guid: String,
+        _reply: Option<crate::store::ReplyTo>,
     ) -> Result<crate::store::IncomingMessage> {
         Ok(crate::store::IncomingMessage {
             guid,
@@ -225,6 +226,7 @@ impl Backend for StubBackend {
         name: String,
         text: Option<String>,
         guid: String,
+        _reply: Option<crate::store::ReplyTo>,
     ) -> Result<crate::store::IncomingMessage> {
         Ok(crate::store::IncomingMessage {
             guid,
@@ -344,6 +346,7 @@ mod tests {
                 name,
                 None,
                 guid.clone(),
+                None,
             )
             .await
             .expect("send_attachment should succeed");
@@ -451,6 +454,7 @@ mod tests {
                 name.clone(),
                 Some(caption.clone()),
                 guid.clone(),
+                None,
             )
             .await
             .expect("send_attachment should succeed");

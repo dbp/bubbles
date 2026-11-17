@@ -636,6 +636,80 @@ pub(super) fn message_widget(
     }
 }
 
+/// The `msg.reply` target for a message's Reply item: (guid, who wrote it,
+/// its text, whether it has attachments). Tapbacks can't be replied to.
+fn reply_action_target(m: &StoredMessage, handles: &[String], contacts: &[Contact]) -> Option<glib::Variant> {
+    if m.associated_guid.is_some() {
+        return None;
+    }
+    let who = sender_display(m, handles, contacts);
+    let text = m.text.clone().unwrap_or_default();
+    Some((m.guid.clone(), who, text, !m.attachments.is_empty()).to_variant())
+}
+
+/// A "Reply" button for a message's right-click popover; it fires
+/// `msg.reply` with `target` and closes the popover.
+fn reply_popover_button(target: &glib::Variant, popover: &gtk::Popover) -> gtk::Button {
+    let content = adw::ButtonContent::builder()
+        .icon_name("mail-reply-sender-symbolic")
+        .label("Reply")
+        .build();
+    let button = gtk::Button::builder().child(&content).css_classes(["flat"]).build();
+    button.set_action_name(Some("msg.reply"));
+    button.set_action_target_value(Some(target));
+    let popover = popover.clone();
+    button.connect_clicked(move |_| popover.popdown());
+    button
+}
+
+/// The quote of the original at the top of a reply's bubble: who wrote it,
+/// over a two-line taste of it, on a tinted band. Clicking it jumps to the
+/// original (`msg.jump`) when that's loaded.
+fn reply_quote(m: &StoredMessage, handles: &[String], contacts: &[Contact]) -> Option<gtk::Widget> {
+    let target = m.reply_to_guid.as_ref()?;
+    let (who, snippet) = match &m.reply_preview {
+        Some(p) => {
+            let who = if p.is_from_me {
+                "You".to_string()
+            } else {
+                p.sender
+                    .as_deref()
+                    .map(|a| crate::contacts::participant_display_name(a, handles, contacts))
+                    .unwrap_or_else(|| "Unknown".to_string())
+            };
+            (who, reply_snippet(p.text.as_deref(), p.has_attachments))
+        }
+        None => ("Reply".to_string(), "Original message not synced here".to_string()),
+    };
+    let name = gtk::Label::builder()
+        .label(&who)
+        .xalign(0.0)
+        .ellipsize(gtk::pango::EllipsizeMode::End)
+        .build();
+    name.add_css_class("reply-quote-name");
+    let text = gtk::Label::builder()
+        .label(&snippet)
+        .xalign(0.0)
+        .wrap(true)
+        .wrap_mode(gtk::pango::WrapMode::WordChar)
+        .lines(2)
+        .ellipsize(gtk::pango::EllipsizeMode::End)
+        .max_width_chars(40)
+        .build();
+    text.add_css_class("reply-quote-text");
+    let column = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    column.append(&name);
+    column.append(&text);
+    let button = gtk::Button::builder()
+        .child(&column)
+        .tooltip_text("Show the original message")
+        .build();
+    button.add_css_class("reply-quote");
+    button.set_action_name(Some("msg.jump"));
+    button.set_action_target_value(Some(&target.to_variant()));
+    Some(button.upcast())
+}
+
 /// Left: grey bubble, with an avatar + sender name in group chats only.
 /// On incoming messages, a right-click gesture opens a popover with the 6
 /// standard tapback emoji buttons.
@@ -736,6 +810,11 @@ fn incoming_message(
             emoji_box.append(&btn);
         }
 
+        if let Some(target) = reply_action_target(m, handles, contacts) {
+            emoji_box.append(&gtk::Separator::new(gtk::Orientation::Vertical));
+            emoji_box.append(&reply_popover_button(&target, &popover));
+        }
+
         popover.set_child(Some(&emoji_box));
         popover.set_parent(&row);
 
@@ -763,6 +842,8 @@ fn incoming_message(
         None,
         None,
         chip,
+        reply_quote(m, handles, contacts),
+        reply_action_target(m, handles, contacts).as_ref(),
     );
     line.append(&body_col);
     let timestamp = time_label(m);
@@ -783,7 +864,7 @@ fn own_message(
     on_retry: Option<&Rc<RetryHandler>>,
     chip: Option<&gtk::Widget>,
 ) -> (gtk::Widget, Option<gtk::Widget>) {
-    let MessageContext { m, show_header: _, show_timestamp, top, previews, preview_cards, .. } = ctx;
+    let MessageContext { m, show_header: _, show_timestamp, top, previews, preview_cards, handles, contacts } = ctx;
     let row = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
         .margin_start(56)
@@ -844,7 +925,29 @@ fn own_message(
         None
     };
 
-    let (body_col, bubble_or_overlay) = message_body(m, true, previews, preview_cards, None, show_edit.as_ref(), show_retry.as_ref(), chip);
+    // Right-click outside the text (which has its own menu): Reply.
+    if let Some(target) = reply_action_target(m, handles, contacts) {
+        let popover = gtk::Popover::builder().autohide(true).build();
+        popover.set_child(Some(&reply_popover_button(&target, &popover)));
+        popover.set_parent(&row);
+        let gesture = gtk::GestureClick::new();
+        gesture.set_button(3);
+        gesture.connect_released(move |_, _, _, _| popover.popup());
+        row.add_controller(gesture);
+    }
+
+    let (body_col, bubble_or_overlay) = message_body(
+        m,
+        true,
+        previews,
+        preview_cards,
+        None,
+        show_edit.as_ref(),
+        show_retry.as_ref(),
+        chip,
+        reply_quote(m, handles, contacts),
+        reply_action_target(m, handles, contacts).as_ref(),
+    );
     line.append(&body_col);
 
     row.append(&line);
@@ -871,6 +974,8 @@ fn message_body(
     show_edit: Option<&Rc<dyn Fn()>>,
     show_retry: Option<&Rc<dyn Fn()>>,
     chip: Option<&gtk::Widget>,
+    quote: Option<gtk::Widget>,
+    reply: Option<&glib::Variant>,
 ) -> (gtk::Widget, Option<gtk::Widget>) {
     let col = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
@@ -928,21 +1033,34 @@ fn message_body(
     let has_text = m.text.as_deref().is_some_and(|t| !strip_marker(t).is_empty())
         && !text.trim().is_empty();
     let is_tapback = m.associated_guid.is_some();
+    // An inline reply's quote of the original: at the top of the text
+    // bubble, or above the attachments when there's no text.
+    let mut quote = quote;
     let bubble_or_overlay: Option<gtk::Widget> = if has_text || is_tapback {
         let bubble = bubble_box(own);
-        bubble.append(&bubble_label(&text, show_picker, show_edit, show_retry));
+        if let Some(q) = quote.take() {
+            bubble.append(&q);
+        }
+        bubble.append(&bubble_label(&text, show_picker, show_edit, show_retry, reply));
         let result = bubble_with_chip(&bubble, own, chip);
         col.append(&result);
         Some(result)
     } else if m.attachments.is_empty() && preview.is_none() {
         let bubble = bubble_box(own);
-        bubble.append(&bubble_label("(no text)", show_picker, show_edit, show_retry));
+        if let Some(q) = quote.take() {
+            bubble.append(&q);
+        }
+        bubble.append(&bubble_label("(no text)", show_picker, show_edit, show_retry, reply));
         let result = bubble_with_chip(&bubble, own, chip);
         col.append(&result);
         Some(result)
     } else {
         None
     };
+    if let Some(q) = quote {
+        q.set_halign(if own { gtk::Align::End } else { gtk::Align::Start });
+        col.prepend(&q);
+    }
 
     // Sender-generated link preview (iMessage rich link). The store already
     // cached the thumbnail on disk; the renderer loads it from `image_path`
@@ -1216,6 +1334,7 @@ fn bubble_label(
     show_picker: Option<&Rc<dyn Fn()>>,
     show_edit: Option<&Rc<dyn Fn()>>,
     show_retry: Option<&Rc<dyn Fn()>>,
+    reply: Option<&glib::Variant>,
 ) -> gtk::Label {
     let markup = text_to_markup(text);
     let label = gtk::Label::builder()
@@ -1241,6 +1360,15 @@ fn bubble_label(
     // are wired.
     let menu = gtk::gio::Menu::new();
     let mut has_any = false;
+
+    // "Reply" resolves to the window's `msg.reply` action, which opens the
+    // "Replying to …" bar above the entry.
+    if let Some(target) = reply {
+        let item = gtk::gio::MenuItem::new(Some("Reply"), None);
+        item.set_action_and_target_value(Some("msg.reply"), Some(target));
+        menu.append_item(&item);
+        has_any = true;
+    }
 
     if let Some(picker) = show_picker {
         let action_group = gtk::gio::SimpleActionGroup::new();

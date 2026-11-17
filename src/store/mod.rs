@@ -374,6 +374,14 @@ fn insert_message(c: &Connection, m: &IncomingMessage) -> rusqlite::Result<()> {
                 params![m.text, m.subject, m.guid],
             )?;
         }
+        // Cloud sync used to drop the reply target; a re-delivery fills it in.
+        if m.reply_to_guid.is_some() {
+            c.execute(
+                "UPDATE message SET reply_to_guid = ?1, reply_part = ?2
+                 WHERE guid = ?3 AND reply_to_guid IS NULL",
+                params![m.reply_to_guid, m.reply_part, m.guid],
+            )?;
+        }
     }
     // Sending from any of our devices marks the conversation read up to that
     // point on all of them. Mirror that locally so a reply sent on the phone
@@ -876,6 +884,7 @@ fn map_message_row(r: &rusqlite::Row) -> rusqlite::Result<StoredMessage> {
         effect: r.get(11)?,
         reply_to_guid: r.get(12)?,
         reply_part: r.get(13)?,
+        reply_preview: None,
         associated_guid: r.get(14)?,
         associated_type: r.get(15)?,
         item_type: r.get(16)?,
@@ -947,6 +956,43 @@ fn attach_to(c: &Connection, messages: &mut [StoredMessage]) -> rusqlite::Result
         if let Some(atts) = by_msg.remove(&m.id) {
             m.attachments = atts;
         }
+    }
+    attach_reply_previews(c, messages)
+}
+
+/// Fill in `reply_preview` for every reply whose original is stored,
+/// wherever it is (another page, another sync). One query per 500 targets.
+fn attach_reply_previews(c: &Connection, messages: &mut [StoredMessage]) -> rusqlite::Result<()> {
+    let mut targets: Vec<String> = messages.iter().filter_map(|m| m.reply_to_guid.clone()).collect();
+    targets.sort();
+    targets.dedup();
+    let mut previews: std::collections::HashMap<String, ReplyPreview> = std::collections::HashMap::new();
+    for chunk in targets.chunks(500) {
+        let marks = vec!["?"; chunk.len()].join(",");
+        let mut stmt = c.prepare(&format!(
+            "SELECT m.guid, h.address, m.is_from_me, m.text,
+                    EXISTS(SELECT 1 FROM attachment a WHERE a.message_id = m.id)
+             FROM message m LEFT JOIN handle h ON h.id = m.sender_handle_id
+             WHERE m.guid IN ({marks})"
+        ))?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(chunk.iter()), |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                ReplyPreview {
+                    sender: r.get(1)?,
+                    is_from_me: r.get::<_, i64>(2)? != 0,
+                    text: r.get(3)?,
+                    has_attachments: r.get::<_, i64>(4)? != 0,
+                },
+            ))
+        })?;
+        for row in rows {
+            let (guid, preview) = row?;
+            previews.insert(guid, preview);
+        }
+    }
+    for m in messages.iter_mut() {
+        m.reply_preview = m.reply_to_guid.as_ref().and_then(|g| previews.get(g).cloned());
     }
     Ok(())
 }
@@ -1696,6 +1742,76 @@ mod tests {
     /// Pin: a re-delivered guid whose text changed (an edit or unsend synced
     /// from CloudKit) updates the stored text; identical text (push-path
     /// fan-out) leaves the row alone, and a missing text never blanks it.
+    /// Pin: an outgoing reply names the whole original by its UTF-16 length,
+    /// as Apple counts it, and an empty (attachment-only) one as length 1.
+    #[test]
+    fn reply_to_counts_utf16_units() {
+        assert_eq!(ReplyTo::to_message("G", "hello").part, "0:0:5");
+        assert_eq!(ReplyTo::to_message("G", "hi \u{1F44B}").part, "0:0:5", "the emoji is two units");
+        assert_eq!(ReplyTo::to_message("G", "").part, "0:0:1");
+        assert_eq!(ReplyTo::to_message("G", "x").guid, "G");
+    }
+
+    /// Pin: a loaded reply carries a preview of the message it answers, even
+    /// from another chat page; one whose original isn't stored has none.
+    #[test]
+    fn replies_load_a_preview_of_their_original() {
+        let mut c = db();
+        apply_blocking(&mut c, Ingest::Message(msg("ORIG", 1000))).unwrap();
+        apply_blocking(
+            &mut c,
+            Ingest::Message(IncomingMessage {
+                reply_to_guid: Some("ORIG".into()),
+                reply_part: Some("0:0:8".into()),
+                ..msg("REPLY", 2000)
+            }),
+        )
+        .unwrap();
+        apply_blocking(
+            &mut c,
+            Ingest::Message(IncomingMessage {
+                reply_to_guid: Some("NOT-SYNCED".into()),
+                ..msg("ORPHAN", 3000)
+            }),
+        )
+        .unwrap();
+        let chat = query_chats(&c).unwrap()[0].id;
+        // Only the newest page, which doesn't include the original.
+        let page = query_messages_page(&c, chat, None, 2).unwrap();
+        let by_guid = |g: &str| page.iter().find(|m| m.guid == g).unwrap().reply_preview.clone();
+        let preview = by_guid("REPLY").expect("original is stored");
+        assert_eq!(preview.text.as_deref(), Some("Hello me"));
+        assert_eq!(preview.sender.as_deref(), msg("ORIG", 0).sender.as_deref());
+        assert!(!preview.is_from_me && !preview.has_attachments);
+        assert_eq!(by_guid("ORPHAN"), None);
+    }
+
+    /// Pin: a re-delivered message fills in a reply target that was stored
+    /// without one, and never replaces one it already has.
+    #[test]
+    fn duplicate_guid_fills_in_a_missing_reply_target() {
+        let mut c = db();
+        apply_blocking(&mut c, Ingest::Message(msg("G-REPLY", 1000))).unwrap();
+        let reply = |guid: &str, part: &str| IncomingMessage {
+            reply_to_guid: Some(guid.into()),
+            reply_part: Some(part.into()),
+            ..msg("G-REPLY", 1000)
+        };
+        let stored = |c: &Connection| -> (Option<String>, Option<String>) {
+            c.query_row(
+                "SELECT reply_to_guid, reply_part FROM message WHERE guid = 'G-REPLY'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap()
+        };
+        assert_eq!(stored(&c), (None, None));
+        apply_blocking(&mut c, Ingest::Message(reply("ORIGINAL", "0:0:5"))).unwrap();
+        assert_eq!(stored(&c), (Some("ORIGINAL".into()), Some("0:0:5".into())));
+        apply_blocking(&mut c, Ingest::Message(reply("OTHER", "0:0:9"))).unwrap();
+        assert_eq!(stored(&c).0.as_deref(), Some("ORIGINAL"), "an existing target is kept");
+    }
+
     #[test]
     fn duplicate_guid_with_new_text_updates_message() {
         let mut c = db();

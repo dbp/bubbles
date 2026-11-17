@@ -35,6 +35,24 @@ impl ChatRef {
     }
 }
 
+/// The message an outgoing inline reply answers: its guid, and the part
+/// Apple names (`0:0:<length>` for the whole of a plain message).
+#[derive(Clone, Debug, PartialEq)]
+pub struct ReplyTo {
+    pub guid: String,
+    pub part: String,
+}
+
+impl ReplyTo {
+    /// A reply to the whole of a message whose text is `text`. The length is
+    /// in UTF-16 units, as Apple counts it; never 0 (an attachment-only
+    /// message is one placeholder character).
+    pub fn to_message(guid: &str, text: &str) -> Self {
+        let len = text.encode_utf16().count().max(1);
+        Self { guid: guid.to_owned(), part: format!("0:0:{len}") }
+    }
+}
+
 /// A content message to insert. Idempotent on `guid`.
 #[derive(Clone, Debug, Default)]
 pub struct IncomingMessage {
@@ -212,12 +230,24 @@ pub struct StoredMessage {
     pub effect: Option<String>,
     pub reply_to_guid: Option<String>,
     pub reply_part: Option<String>,
+    /// The message this one replies to, when it's stored (it may be in
+    /// another page, or not synced at all).
+    pub reply_preview: Option<ReplyPreview>,
     pub associated_guid: Option<String>,
     pub associated_type: Option<i64>,
     pub item_type: i64,
     pub send_error: Option<SendErrorCategory>,
     pub pending: bool,
     pub attachments: Vec<StoredAttachment>,
+}
+
+/// What a reply shows of the message it answers.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ReplyPreview {
+    pub sender: Option<String>,
+    pub is_from_me: bool,
+    pub text: Option<String>,
+    pub has_attachments: bool,
 }
 
 /// An attachment as read back for display.

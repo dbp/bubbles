@@ -91,6 +91,15 @@ type RetryHandler = dyn Fn(String, String);
 /// real send.
 type EditSaveHandler = dyn Fn(String, String);
 
+/// What the composer is replying to: the target for the send, and how the
+/// "Replying to …" bar names it.
+#[derive(Clone, Debug)]
+pub(super) struct ReplyTarget {
+    pub(super) to: crate::store::ReplyTo,
+    pub(super) who: String,
+    pub(super) snippet: String,
+}
+
 /// Default: send read receipts when a chat is viewed.
 pub(super) const SEND_READ_RECEIPTS: bool = true;
 
@@ -267,6 +276,54 @@ row.entry image.edit-icon {
   background-color: alpha(@accent_bg_color, 0.25);
   border-left: 4px solid @accent_bg_color;
 }
+/* Inline replies: the quote of the original on a tinted band at the top of
+   a reply's bubble (currentColor keeps it right on both bubble colours), a
+   brief highlight on the original when jumped to, and the composer's bar. */
+button.reply-quote {
+  background-color: alpha(currentColor, 0.06);
+  background-image: none;
+  border: none;
+  border-left: 3px solid alpha(currentColor, 0.45);
+  font-weight: normal;
+  border-radius: 8px;
+  box-shadow: none;
+  color: inherit;
+  padding: 3px 8px;
+  margin: 3px -6px 5px -6px;
+  min-height: 0;
+}
+button.reply-quote:hover {
+  background-color: alpha(currentColor, 0.12);
+}
+.reply-quote-name {
+  font-weight: bold;
+  font-size: 0.82em;
+}
+.reply-quote-text {
+  font-size: 0.85em;
+  font-weight: normal;
+  opacity: 0.8;
+}
+.reply-flash {
+  outline: 2px solid @accent_bg_color;
+  outline-offset: 2px;
+  border-radius: 18px;
+}
+.reply-banner {
+  background-color: alpha(currentColor, 0.05);
+  border-left: 3px solid @accent_bg_color;
+  border-radius: 8px;
+  padding: 4px 4px 4px 10px;
+}
+.reply-banner-title {
+  color: @accent_color;
+  font-weight: bold;
+  font-size: 0.85em;
+}
+.reply-banner-text {
+  font-size: 0.9em;
+  opacity: 0.75;
+}
 ";
 
 
@@ -358,6 +415,13 @@ struct Ui {
     pending_chip: gtk::Box,
     pending_chip_label: gtk::Label,
     pending_chip_icon: gtk::Image,
+    // The message the next send answers (an inline reply), while the
+    // "Replying to …" bar shows. Cleared on send, on cancel, and on
+    // switching chats.
+    reply_target: Rc<RefCell<Option<ReplyTarget>>>,
+    reply_chip: gtk::Box,
+    reply_chip_title: gtk::Label,
+    reply_chip_text: gtk::Label,
     compose_outer: gtk::Box,
     /// Swaps the content pane between the empty-state illustration (no chat
     /// open) and the timeline + compose view.
@@ -631,11 +695,50 @@ pub fn enter_messaging(
     pending_chip_close.set_focus_on_click(false);
     pending_chip.append(&pending_chip_close);
 
-    // Outer vertical box: chip row above the compose bar.
+    // "Replying to …" bar: shown while the next send is an inline reply.
+    // Who, in the accent colour, over a one-line taste of their message.
+    let reply_chip = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(6)
+        .margin_start(10)
+        .margin_end(10)
+        .margin_top(6)
+        .margin_bottom(2)
+        .visible(false)
+        .build();
+    reply_chip.add_css_class("reply-banner");
+    let reply_chip_lines = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .hexpand(true)
+        .valign(gtk::Align::Center)
+        .build();
+    let reply_chip_title = gtk::Label::builder()
+        .xalign(0.0)
+        .ellipsize(gtk::pango::EllipsizeMode::End)
+        .build();
+    reply_chip_title.add_css_class("reply-banner-title");
+    let reply_chip_text = gtk::Label::builder()
+        .xalign(0.0)
+        .ellipsize(gtk::pango::EllipsizeMode::End)
+        .single_line_mode(true)
+        .build();
+    reply_chip_text.add_css_class("reply-banner-text");
+    reply_chip_lines.append(&reply_chip_title);
+    reply_chip_lines.append(&reply_chip_text);
+    reply_chip.append(&reply_chip_lines);
+    let reply_chip_close = gtk::Button::from_icon_name("window-close-symbolic");
+    reply_chip_close.add_css_class("flat");
+    reply_chip_close.set_valign(gtk::Align::Center);
+    reply_chip_close.set_focus_on_click(false);
+    reply_chip_close.set_tooltip_text(Some("Cancel reply"));
+    reply_chip.append(&reply_chip_close);
+
+    // Outer vertical box: chip rows above the compose bar.
     let compose_outer = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .spacing(0)
         .build();
+    compose_outer.append(&reply_chip);
     compose_outer.append(&pending_chip);
     compose_outer.append(&compose);
     // Hidden until a chat is opened — the compose bar only makes sense
@@ -735,6 +838,10 @@ pub fn enter_messaging(
         pending_chip: pending_chip.clone(),
         pending_chip_label: pending_chip_label.clone(),
         pending_chip_icon,
+        reply_target: Rc::new(RefCell::new(None)),
+        reply_chip: reply_chip.clone(),
+        reply_chip_title: reply_chip_title.clone(),
+        reply_chip_text: reply_chip_text.clone(),
         compose_outer: compose_outer.clone(),
         content_stack: content_stack.clone(),
         rendered_guids: Rc::new(RefCell::new(Vec::new())),
@@ -807,6 +914,12 @@ pub fn enter_messaging(
         pending_chip_close.connect_clicked(move |_| ui.clear_pending_attachment());
     }
 
+    // Close button on the reply bar cancels the reply.
+    {
+        let ui = ui.clone();
+        reply_chip_close.connect_clicked(move |_| ui.clear_reply_target());
+    }
+
     // Sidebar hamburger menu actions ("menu" group, resolved via the split).
     {
         let actions = gtk::gio::SimpleActionGroup::new();
@@ -829,6 +942,42 @@ pub fn enter_messaging(
         });
         actions.add_action(&about);
         split.insert_action_group("menu", Some(&actions));
+    }
+
+    // Message actions ("msg" group): Reply from a bubble's menu, carrying the
+    // original's (guid, who, text, has attachments); and jumping to the
+    // original from a reply's quote, carrying its guid.
+    {
+        let actions = gtk::gio::SimpleActionGroup::new();
+        let reply_ty = glib::VariantTy::new("(sssb)").expect("valid variant type");
+        let reply = gtk::gio::SimpleAction::new("reply", Some(reply_ty));
+        reply.connect_activate({
+            let ui = ui.clone();
+            move |_, param| {
+                let Some((guid, who, text, has_attachments)) =
+                    param.and_then(|p| p.get::<(String, String, String, bool)>())
+                else {
+                    return;
+                };
+                ui.set_reply_target(ReplyTarget {
+                    to: crate::store::ReplyTo::to_message(&guid, &text),
+                    who,
+                    snippet: helpers::reply_snippet(Some(&text), has_attachments),
+                });
+            }
+        });
+        actions.add_action(&reply);
+        let jump = gtk::gio::SimpleAction::new("jump", Some(glib::VariantTy::STRING));
+        jump.connect_activate({
+            let ui = ui.clone();
+            move |_, param| {
+                if let Some(guid) = param.and_then(|p| p.get::<String>()) {
+                    ui.jump_to_message(&guid);
+                }
+            }
+        });
+        actions.add_action(&jump);
+        split.insert_action_group("msg", Some(&actions));
     }
 
     // Load the previous page when the user scrolls near the top (ignoring the
@@ -945,6 +1094,20 @@ pub fn enter_messaging(
             ui.try_attach_from_clipboard()
         });
         entry.add_controller(paste_ctrl);
+    }
+
+    // Escape in the entry cancels a reply in progress.
+    {
+        let escape_ctrl = gtk::EventControllerKey::new();
+        let ui = ui.clone();
+        escape_ctrl.connect_key_pressed(move |_ctrl, keyval, _keycode, _state| {
+            if keyval == gtk::gdk::Key::Escape && ui.reply_target.borrow().is_some() {
+                ui.clear_reply_target();
+                return glib::Propagation::Stop;
+            }
+            glib::Propagation::Proceed
+        });
+        entry.add_controller(escape_ctrl);
     }
 
     // Attach: open the system file picker, then set a pending attachment.

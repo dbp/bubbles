@@ -1486,10 +1486,14 @@ impl Backend for RustpushBackend {
         my_handle: &str,
         text: String,
         guid: String,
+        reply: Option<crate::store::ReplyTo>,
     ) -> Result<IncomingMessage> {
         let imclient = client(c).clone();
         let conversation = conversation_from(chat);
-        let normal = NormalMessage::new(text.clone(), MessageType::IMessage);
+        let mut normal = NormalMessage::new(text.clone(), MessageType::IMessage);
+        // An inline reply: rustpush writes these as `r:<part>:<guid>`.
+        normal.reply_guid = reply.as_ref().map(|r| r.guid.clone());
+        normal.reply_part = reply.as_ref().map(|r| r.part.clone());
         let mut inst = MessageInst::new(conversation, my_handle, Message::Message(normal));
         inst.id = guid.clone();
         let date = now_ms();
@@ -1594,6 +1598,8 @@ impl Backend for RustpushBackend {
             text: Some(text),
             service: Some("iMessage".into()),
             date,
+            reply_to_guid: reply.as_ref().map(|r| r.guid.clone()),
+            reply_part: reply.map(|r| r.part),
             ..Default::default()
         })
     }
@@ -1662,6 +1668,7 @@ impl Backend for RustpushBackend {
         name: String,
         text: Option<String>,
         guid: String,
+        reply: Option<crate::store::ReplyTo>,
     ) -> Result<IncomingMessage> {
         use std::io::Seek;
 
@@ -1685,6 +1692,8 @@ impl Backend for RustpushBackend {
 
         let mut normal = NormalMessage::new(String::new(), MessageType::IMessage);
         normal.parts = build_attachment_message_parts(text.as_deref(), attachment);
+        normal.reply_guid = reply.as_ref().map(|r| r.guid.clone());
+        normal.reply_part = reply.as_ref().map(|r| r.part.clone());
         let mut inst = MessageInst::new(conversation, my_handle, Message::Message(normal));
         inst.id = guid.clone();
         let date = now_ms();
@@ -5565,6 +5574,7 @@ mod clique_setup_secrets_tests {
             _my_handle: &str,
             text: String,
             guid: String,
+            _reply: Option<crate::store::ReplyTo>,
         ) -> Result<crate::store::IncomingMessage> {
             Ok(crate::store::IncomingMessage {
                 guid,
@@ -5612,6 +5622,7 @@ mod clique_setup_secrets_tests {
             name: String,
             text: Option<String>,
             guid: String,
+            _reply: Option<crate::store::ReplyTo>,
         ) -> Result<crate::store::IncomingMessage> {
             Ok(crate::store::IncomingMessage {
                 guid,
@@ -6006,6 +6017,7 @@ mod clique_setup_bottle_prompt_tests {
             _my_handle: &str,
             text: String,
             guid: String,
+            _reply: Option<crate::store::ReplyTo>,
         ) -> Result<crate::store::IncomingMessage> {
             Ok(crate::store::IncomingMessage {
                 guid,
@@ -6053,6 +6065,7 @@ mod clique_setup_bottle_prompt_tests {
             name: String,
             text: Option<String>,
             guid: String,
+            _reply: Option<crate::store::ReplyTo>,
         ) -> Result<crate::store::IncomingMessage> {
             Ok(crate::store::IncomingMessage {
                 guid,

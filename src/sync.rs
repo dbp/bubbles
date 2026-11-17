@@ -23,6 +23,22 @@ pub fn apple_time_to_unix_ms(apple_ns: i64) -> i64 {
     (apple_ns / 1_000_000) + 978_307_200_000
 }
 
+/// The message an inline reply answers, from a record's `msgProto2.reply`:
+/// `r:<part>:<guid>`, where the part (`0:0:<length>`) has colons of its own.
+/// The guid is the piece with a `-`, as rustpush reads the same field on the
+/// push path; returns `(guid, part)`, or `None` for anything malformed
+/// (where rustpush's parser would panic).
+pub fn parse_reply_target(raw: &str) -> Option<(String, String)> {
+    let rest = raw.strip_prefix("r:")?;
+    let mut pieces: Vec<&str> = rest.split(':').collect();
+    let at = pieces.iter().position(|p| p.contains('-'))?;
+    let guid = pieces.remove(at);
+    if guid.trim_matches('-').is_empty() {
+        return None;
+    }
+    Some((guid.to_owned(), pieces.join(":")))
+}
+
 /// Translate a CloudKit [`CloudMessage`] record into the app's internal [`Ingest`].
 ///
 /// Returns one of:
@@ -74,6 +90,16 @@ pub fn cloud_message_to_ingest(
 
     // --- Plain message? ---
     if let Some(ref text) = proto.text {
+        // An inline reply names the message it answers here.
+        let reply = cm
+            .msg_proto_2
+            .as_ref()
+            .and_then(|p| p.reply.as_deref())
+            .and_then(parse_reply_target);
+        let (reply_to_guid, reply_part) = match reply {
+            Some((guid, part)) => (Some(guid), Some(part)),
+            None => (None, None),
+        };
         return Ingest::Message(IncomingMessage {
             guid: cm.guid,
             chat,
@@ -84,8 +110,8 @@ pub fn cloud_message_to_ingest(
             service: Some(cm.service),
             date: apple_time_to_unix_ms(cm.time),
             effect: proto.effect.clone(),
-            reply_to_guid: None,
-            reply_part: None,
+            reply_to_guid,
+            reply_part,
             item_type: 0,
             attachments: Vec::new(),
             pending: false,
@@ -2595,6 +2621,43 @@ mod chat_mapping_tests {
     }
 
     #[test]
+    fn reply_targets_parse_and_malformed_ones_dont_panic() {
+        let guid = "1B4E28BA-2FA1-11D2-883F-0016D3CCA427";
+        assert_eq!(
+            parse_reply_target(&format!("r:0:0:12:{guid}")),
+            Some((guid.to_owned(), "0:0:12".to_owned()))
+        );
+        // The guid is found by its dashes wherever it sits.
+        assert_eq!(
+            parse_reply_target(&format!("r:{guid}:1:0:3")),
+            Some((guid.to_owned(), "1:0:3".to_owned()))
+        );
+        for bad in ["", "r:", "x:0:0:5:a-b", "r:0:0:5", "r:-:0", "0:0:5:a-b"] {
+            assert_eq!(parse_reply_target(bad), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn synced_reply_keeps_the_message_it_answers() {
+        let guid = "1B4E28BA-2FA1-11D2-883F-0016D3CCA427";
+        let mut record = cm("g-reply", "iMessage;-;+12345", "+12345", "me@icloud.com", MessageFlags::IS_FINISHED);
+        record.msg_proto_2 = Some(GZipWrapper(rustpush::cloud_messages::cloudmessagesp::MessageProto2 {
+            reply: Some(format!("r:0:0:7:{guid}")),
+        }));
+        let m = message(cloud_message_to_ingest(record, &[], &HashMap::new()));
+        assert_eq!(m.reply_to_guid.as_deref(), Some(guid));
+        assert_eq!(m.reply_part.as_deref(), Some("0:0:7"));
+
+        // No msgProto2, or a malformed one: an ordinary message.
+        let plain = message(cloud_message_to_ingest(
+            cm("g-plain", "iMessage;-;+12345", "+12345", "me@icloud.com", MessageFlags::IS_FINISHED),
+            &[],
+            &HashMap::new(),
+        ));
+        assert_eq!(plain.reply_to_guid, None);
+    }
+
+    #[test]
     fn chat_id_shapes_hide_the_identifier() {
         assert_eq!(chat_id_shape("iMessage;+;chat123456789"), "iMessage;+;chatN");
         assert_eq!(chat_id_shape("SMS;-;+14015550100"), "SMS;-;phone");
@@ -2866,8 +2929,9 @@ pub struct SyncCursor {
 /// finished scan must be redone once to correct what's already stored.
 /// 1: group messages keyed by group id (before, they were filed under the
 /// sender's 1:1). 2: iCloud's read state applied (before, every synced
-/// incoming message without a later reply showed as unread).
-pub const SCAN_VERSION: u32 = 2;
+/// incoming message without a later reply showed as unread). 3: inline
+/// replies keep the message they answer (before, it was dropped).
+pub const SCAN_VERSION: u32 = 3;
 
 /// The initial scan ran with an older [`SCAN_VERSION`].
 pub fn scan_is_outdated(cursor: &SyncCursor) -> bool {

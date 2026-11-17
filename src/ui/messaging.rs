@@ -59,6 +59,29 @@ impl super::Ui {
         );
     }
 
+    /// Scroll to a loaded message (the original a reply quotes) and flash it.
+    /// A message that isn't loaded (an older page) is left alone.
+    pub(super) fn jump_to_message(&self, guid: &str) {
+        let Some(bubble) = self.current_chips.borrow().get(guid).map(|e| e.bubble.clone()) else {
+            log::debug!("jump: original not loaded");
+            return;
+        };
+        let Some(point) =
+            bubble.compute_point(&self.msg_container, &gtk::graphene::Point::new(0.0, 0.0))
+        else {
+            return;
+        };
+        let adj = self.scroller.vadjustment();
+        // A third of the way down the view, so some context shows above it.
+        let target = (f64::from(point.y()) - adj.page_size() / 3.0)
+            .clamp(adj.lower(), (adj.upper() - adj.page_size()).max(adj.lower()));
+        adj.set_value(target);
+        bubble.add_css_class("reply-flash");
+        glib::timeout_add_local_once(std::time::Duration::from_millis(1200), move || {
+            bubble.remove_css_class("reply-flash");
+        });
+    }
+
     pub(super) fn open_chat(&self, chat: &ChatSummary) {
         // Switching away: stop any outbound typing on the previous chat, and clear
         // the inbound indicator (it belongs to the chat we're leaving).
@@ -70,6 +93,10 @@ impl super::Ui {
         }
         self.hide_typing_indicator();
         self.clear_pending_attachment();
+        // A reply belongs to the chat it was started in.
+        if prev.as_ref().map(|p| p.id) != Some(chat.id) {
+            self.clear_reply_target();
+        }
         *self.open_summary.borrow_mut() = Some(chat.clone());
         self.content_page.set_title(&chat_title(chat, &self.handles, &self.contacts.borrow()));
         self.rename_button.set_sensitive(true);

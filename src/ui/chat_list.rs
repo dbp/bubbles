@@ -589,7 +589,7 @@ impl super::Ui {
         gtk_bridge::spawn(
             async move {
                 backend
-                    .send_text(&client, &chat_ref, &my_handle, text_owned, guid)
+                    .send_text(&client, &chat_ref, &my_handle, text_owned, guid, None)
                     .await?;
                 Ok::<(), anyhow::Error>(())
             },
