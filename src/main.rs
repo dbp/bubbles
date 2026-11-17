@@ -42,7 +42,17 @@ use protocol::Backend;
 
 const APP_ID: &str = "io.github.chrispouliot.Bubbles";
 
+/// When the process started, so startup phases can log how long they took to
+/// reach (timings only, never content).
+static STARTED: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+
+/// Milliseconds since the process started.
+pub fn since_start_ms() -> u128 {
+    STARTED.get().map(|t| t.elapsed().as_millis()).unwrap_or(0)
+}
+
 fn main() -> glib::ExitCode {
+    STARTED.get_or_init(std::time::Instant::now);
     // rustls 0.23 won't auto-pick a crypto provider when more than one is linked.
     // reqwest's rustls-tls pulls aws-lc-rs; our IMD fetch (ureq) pulls ring. Select
     // one explicitly before any TLS happens (session restore, Apple calls, IMD fetch).

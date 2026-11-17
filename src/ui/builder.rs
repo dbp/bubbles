@@ -450,9 +450,12 @@ pub(super) fn build_preview_bubble() -> gtk::Widget {
 
 /// A sidebar row: avatar + chat name + unread badge, with right-click context
 /// menu and long-press selection gesture.
-pub(super) fn chat_row(ui: &Ui, c: &ChatSummary) -> gtk::ListBoxRow {
+/// One sidebar row's content. The sidebar is a `gtk::ListView`, which builds
+/// these only for the rows on screen (binding them as they scroll in), so a
+/// long chat history costs nothing to show.
+pub(super) fn chat_row(ui: &Ui, c: &ChatSummary) -> gtk::Box {
     let title = chat_title(c, &ui.handles, &ui.contacts.borrow());
-    let row = gtk::ListBoxRow::new();
+    let row = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     row.add_css_class("navigation-sidebar-row");
     if ui.chat_selection.borrow().is_selected(c.id) {
         row.add_css_class("chat-row-selected");
@@ -501,7 +504,8 @@ pub(super) fn chat_row(ui: &Ui, c: &ChatSummary) -> gtk::ListBoxRow {
         box_.append(&badge);
     }
 
-    row.set_child(Some(&box_));
+    box_.set_hexpand(true);
+    row.append(&box_);
 
     // --- Right-click context menu ---
     let gesture_right = gtk::GestureClick::new();

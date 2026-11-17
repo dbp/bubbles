@@ -335,7 +335,12 @@ struct Ui {
     split: adw::NavigationSplitView,
     content_page: adw::NavigationPage,
     rename_button: gtk::Button,
-    chat_list: gtk::ListBox,
+    // The sidebar: a ListView over `chat_model` (one BoxedAnyObject holding a
+    // ChatSummary per chat, in `chats` order). It only builds rows that are
+    // on screen, so ~1,500 chats show as fast as 20.
+    chat_list: gtk::ListView,
+    chat_model: gtk::gio::ListStore,
+    chat_selection_model: gtk::SingleSelection,
     chats: Rc<RefCell<Vec<ChatSummary>>>,
     msg_container: gtk::Box,
     scroller: gtk::ScrolledWindow,
@@ -489,10 +494,21 @@ pub fn enter_messaging(
     install_css();
 
     // --- sidebar (chat list) ---
-    let chat_list = gtk::ListBox::new();
+    // Rows are built by `chat_factory` (wired below, once `ui` exists) only
+    // for the chats on screen.
+    let chat_model = gtk::gio::ListStore::new::<glib::BoxedAnyObject>();
+    let chat_selection_model = gtk::SingleSelection::builder()
+        .model(&chat_model)
+        .autoselect(false)
+        .can_unselect(true)
+        .build();
+    let chat_factory = gtk::SignalListItemFactory::new();
+    let chat_list = gtk::ListView::builder()
+        .model(&chat_selection_model)
+        .factory(&chat_factory)
+        .single_click_activate(true)
+        .build();
     chat_list.add_css_class("navigation-sidebar");
-    chat_list.set_selection_mode(gtk::SelectionMode::Single);
-    chat_list.set_activate_on_single_click(true);
 
     // Compose entry is hoisted out of the `compose` box so the chat-list and
     // message-container click handlers can capture it and clear its own text
@@ -512,15 +528,6 @@ pub fn enter_messaging(
     entry_focus.connect_enter(move |_ctrl| deselect_all_labels());
     entry.add_controller(entry_focus);
 
-    // Clicking a chat row must drop any in-progress text selection/cursor in
-    // the open message, otherwise the highlight lingers while the user is
-    // jumping between chats. Also clear any text selection in the compose
-    // entry itself.
-    let entry_for_chat_list = entry.clone();
-    chat_list.connect_row_activated(move |_, _row| {
-        deselect_all_labels();
-        defocus_entry(&entry_for_chat_list);
-    });
     // Hamburger menu at the end of the sidebar header.
     let main_menu = gtk::gio::Menu::new();
     main_menu.append(Some("Mark All as Read"), Some("menu.mark-all-read"));
@@ -796,6 +803,8 @@ pub fn enter_messaging(
         content_page: content_page.clone(),
         rename_button: rename_button.clone(),
         chat_list: chat_list.clone(),
+        chat_model: chat_model.clone(),
+        chat_selection_model: chat_selection_model.clone(),
         chats: Rc::new(RefCell::new(Vec::new())),
         msg_container: msg_container.clone(),
         scroller: msg_scroller.clone(),
@@ -870,25 +879,39 @@ pub fn enter_messaging(
         });
     }
 
+    // Sidebar rows: built when a chat scrolls into view, dropped when it
+    // scrolls out.
+    {
+        let ui = ui.clone();
+        chat_factory.connect_bind(move |_, item| {
+            let Some(item) = item.downcast_ref::<gtk::ListItem>() else { return };
+            let Some(obj) = item.item().and_downcast::<glib::BoxedAnyObject>() else { return };
+            let chat = obj.borrow::<ChatSummary>();
+            item.set_child(Some(&chat_row(&ui, &chat)));
+        });
+        chat_factory.connect_unbind(|_, item| {
+            if let Some(item) = item.downcast_ref::<gtk::ListItem>() {
+                item.set_child(None::<&gtk::Widget>);
+            }
+        });
+    }
+
     // Open a chat when its row is activated (or toggle selection in selection mode).
     {
         let ui = ui.clone();
-        chat_list.connect_row_activated(move |_list, row| {
-            let idx = row.index();
-            if idx < 0 {
-                return;
-            }
-            let chat = ui.chats.borrow().get(idx as usize).cloned();
+        let entry_for_chat_list = entry.clone();
+        chat_list.connect_activate(move |_list, position| {
+            // Drop any in-progress text selection/cursor in the open message
+            // (and in the entry), or the highlight lingers across chats.
+            deselect_all_labels();
+            defocus_entry(&entry_for_chat_list);
+            let chat = ui.chats.borrow().get(position as usize).cloned();
             if let Some(chat) = chat {
                 if ui.chat_selection.borrow().is_selecting() {
-                    // In selection mode, toggle this chat instead of opening it.
+                    // In selection mode, toggle this chat instead of opening it,
+                    // and rebind its row so its selected look follows.
                     ui.chat_selection.borrow_mut().toggle_chat(chat.id);
-                    // Update the row's visual selection state.
-                    if ui.chat_selection.borrow().is_selected(chat.id) {
-                        row.add_css_class("chat-row-selected");
-                    } else {
-                        row.remove_css_class("chat-row-selected");
-                    }
+                    ui.chat_model.items_changed(position, 1, 1);
                 } else {
                     ui.open_chat(&chat);
                 }
@@ -1234,10 +1257,20 @@ pub fn enter_messaging(
     // immediately — no flash of bare addresses on second+ launch.
     let ui_for_cache = ui.clone();
     let store_for_cache = ui.store.clone();
+    log::info!("startup: messaging view at {} ms", crate::since_start_ms());
     gtk_bridge::spawn(
-        async move { store_for_cache.all_contacts().await },
-        move |result| {
+        async move {
+            let t = std::time::Instant::now();
+            let cached = store_for_cache.all_contacts().await;
+            (cached, t.elapsed().as_millis())
+        },
+        move |(result, took)| {
             if let Ok(cached) = result {
+                log::info!(
+                    "startup: {} cached contacts loaded in {took} ms (at {} ms)",
+                    cached.len(),
+                    crate::since_start_ms()
+                );
                 *ui_for_cache.contacts.borrow_mut() = cached;
             }
             ui_for_cache.reload_chats(|_| {});
@@ -1255,11 +1288,18 @@ pub fn enter_messaging(
                         Box::new(crate::contacts_eds::EdsContactSource),
                         Box::new(VdirContactSource::new(VdirContactSource::default_root())),
                     ]);
-                    crate::contacts::refresh_and_collect(&source, &store_for_contacts).await
+                    let t = std::time::Instant::now();
+                    let result = crate::contacts::refresh_and_collect(&source, &store_for_contacts).await;
+                    (result, t.elapsed().as_millis())
                 },
-                move |result| {
+                move |(result, took)| {
                     match result {
                         Ok(contacts) => {
+                            log::info!(
+                                "startup: contact refresh ({} contacts) took {took} ms (at {} ms)",
+                                contacts.len(),
+                                crate::since_start_ms()
+                            );
                             *ui_for_contacts.contacts.borrow_mut() = contacts;
                             ui_for_contacts.schedule_refresh();
                         }

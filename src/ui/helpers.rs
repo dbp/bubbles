@@ -278,12 +278,6 @@ pub(super) fn chat_ref_of(c: &ChatSummary) -> ChatRef {
     }
 }
 
-pub(super) fn clear(list: &gtk::ListBox) {
-    while let Some(child) = list.first_child() {
-        list.remove(&child);
-    }
-}
-
 pub(super) fn clear_box(b: &gtk::Box) {
     while let Some(child) = b.first_child() {
         b.remove(&child);

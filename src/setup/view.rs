@@ -62,12 +62,14 @@ pub fn build_window(
     // stack with either the messaging UI (restored) or the hardware page.
     nav.push(&restoring_page());
 
+    log::info!("startup: restoring session at {} ms", crate::since_start_ms());
     let fut = flow::restore(backend.clone());
     let nav_cb = nav.clone();
     let state_cb = state.clone();
     let backend_cb = backend.clone();
     gtk_bridge::spawn(fut, move |result| match result {
         Ok(Some(restored)) => {
+            log::info!("startup: session restored at {} ms", crate::since_start_ms());
             {
                 let mut s = state_cb.borrow_mut();
                 s.config = Some(restored.config);

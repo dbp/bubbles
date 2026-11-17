@@ -150,24 +150,67 @@ impl super::Ui {
     pub(super) fn reload_chats(&self, on_chats: impl FnOnce(&[ChatSummary]) + 'static) {
         let store = self.store.clone();
         let ui = self.clone();
-        gtk_bridge::spawn(async move { store.chats().await }, move |res| {
+        gtk_bridge::spawn(
+            async move {
+                let t = std::time::Instant::now();
+                let chats = store.chats().await;
+                (chats, t.elapsed().as_millis())
+            },
+            move |(res, query_ms)| {
             let chats = res.unwrap_or_else(|e| {
                 eprintln!("chats load error: {e:#}");
                 Vec::new()
             });
             on_chats(&chats);
-            clear(&ui.chat_list);
-            for c in &chats {
-                ui.chat_list.append(&chat_row(&ui, c));
-            }
+            // Startup timing is logged at info for the first load only;
+            // later refreshes (every incoming message) at debug.
+            let first_load = !ui.notify_swept.get();
+            let rows_started = std::time::Instant::now();
+            // Swap the whole model in one go: the ListView rebinds only the
+            // rows on screen. Keep the scroll position across the swap.
+            let adj = ui.chat_list.vadjustment();
+            let scroll = adj.as_ref().map(|a| a.value());
+            *ui.chats.borrow_mut() = chats.clone();
+            let objects: Vec<glib::BoxedAnyObject> =
+                chats.iter().cloned().map(glib::BoxedAnyObject::new).collect();
+            ui.chat_model.splice(0, ui.chat_model.n_items(), &objects);
             // Keep the open chat highlighted across refreshes.
-            if let Some(open) = ui.open_summary.borrow().as_ref() {
-                if let Some(i) = chats.iter().position(|c| c.id == open.id) {
-                    if let Some(row) = ui.chat_list.row_at_index(i as i32) {
-                        ui.chat_list.select_row(Some(&row));
-                    }
-                }
+            let open_pos = ui
+                .open_summary
+                .borrow()
+                .as_ref()
+                .and_then(|open| chats.iter().position(|c| c.id == open.id));
+            ui.chat_selection_model
+                .set_selected(open_pos.map_or(gtk::INVALID_LIST_POSITION, |i| i as u32));
+            if let (Some(adj), Some(value)) = (adj, scroll) {
+                adj.set_value(value);
+                // The list re-measures on its next layout, which can clamp
+                // the value first; put it back once that's done.
+                glib::idle_add_local_once(move || adj.set_value(value));
             }
+            let rows_ms = rows_started.elapsed().as_millis();
+            // When the list is on screen: GTK lays out and paints after this
+            // returns, so time the frame that follows (the second tick from
+            // now means the first one's layout and paint are done).
+            {
+                let ticks = std::cell::Cell::new(0u8);
+                let painted_from = std::time::Instant::now();
+                ui.chat_list.add_tick_callback(move |_, _| {
+                    ticks.set(ticks.get() + 1);
+                    if ticks.get() < 2 {
+                        return glib::ControlFlow::Continue;
+                    }
+                    let level = if first_load { log::Level::Info } else { log::Level::Debug };
+                    log::log!(
+                        level,
+                        "chat list: on screen {} ms after the model was filled (at {} ms)",
+                        painted_from.elapsed().as_millis(),
+                        crate::since_start_ms()
+                    );
+                    glib::ControlFlow::Break
+                });
+            }
+            let withdraw_started = std::time::Instant::now();
             // Withdraw notifications for chats that are no longer unread — covers
             // reads synced from another device (receipt or self-sent reply), which
             // clear unread here without us opening the chat.
@@ -183,10 +226,18 @@ impl super::Ui {
                     .filter(|&id| !chats.iter().any(|c| c.id == id && c.unread > 0))
                     .collect()
             };
+            let withdrawn = read_off.len();
             for id in read_off {
                 ui.withdraw_chat_notification(id);
             }
-            *ui.chats.borrow_mut() = chats;
+            let level = if first_load { log::Level::Info } else { log::Level::Debug };
+            log::log!(
+                level,
+                "chat list: {} chats, query {query_ms} ms, model {rows_ms} ms, {withdrawn} notifications withdrawn in {} ms (at {} ms)",
+                chats.len(),
+                withdraw_started.elapsed().as_millis(),
+                crate::since_start_ms()
+            );
         });
     }
 
