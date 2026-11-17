@@ -15,9 +15,12 @@ impl super::Ui {
             match gtk::gdk::Texture::from_filename(&att.path) {
                 Ok(texture) => self.pending_chip_icon.set_paintable(Some(&texture)),
                 Err(e) => {
+                    // Neither the path nor the error text (which quotes the
+                    // file name): attachment names stay out of the logs.
                     eprintln!(
-                        "pending attachment thumbnail: failed to decode {}: {e}",
-                        att.path.display()
+                        "pending attachment thumbnail: failed to decode {} ({})",
+                        att.mime,
+                        e.domain().as_str()
                     );
                     self.pending_chip_icon.set_icon_name(Some("text-x-generic-symbolic"));
                 }

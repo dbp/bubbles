@@ -1236,8 +1236,8 @@ impl Backend for RustpushBackend {
                                 if let Message::Typing(typing, _) = &inst.message {
                                     let from_me = is_from_me(&inst, &handles);
                                     log::debug!(
-                                        "typing recv from={:?} from_me={from_me} typing={typing}",
-                                        inst.sender
+                                        "typing recv id={} from_me={from_me} typing={typing}",
+                                        inst.id
                                     );
                                     if !from_me {
                                         if let Some(conv) = &inst.conversation {
@@ -2773,43 +2773,34 @@ where
     }
 }
 
-/// Spike-only: dump an inbound message's salient fields. `Message` doesn't
-/// derive `Debug`, so we hand-format the variants we care about.
+/// Log one line per inbound message. See [`recv_log_line`] for what it holds.
 fn log_inst(inst: &MessageInst) {
-    let (participants, name) = match &inst.conversation {
-        Some(c) => (
-            c.participants.join(", "),
-            c.cv_name.clone().unwrap_or_default(),
+    log::info!("{}", recv_log_line(inst));
+}
+
+/// The `RECV` log line for an inbound message: its id, timestamp, kind, and
+/// whether it is a reply or carries an effect or subject, plus the participant
+/// count. The log file is plain text on disk, so message text, subjects, group
+/// names and handles never go in it.
+fn recv_log_line(inst: &MessageInst) -> String {
+    let participants = inst
+        .conversation
+        .as_ref()
+        .map_or(0, |c| c.participants.len());
+    let (reply, effect, subject) = match &inst.message {
+        Message::Message(n) => (
+            n.reply_guid.is_some(),
+            n.effect.is_some(),
+            n.subject.is_some(),
         ),
-        None => (String::new(), String::new()),
+        _ => (false, false, false),
     };
-    let body = match &inst.message {
-        Message::Message(n) => {
-            let mut s = format!("text={:?}", n.parts.raw_text());
-            if let Some(r) = &n.reply_guid {
-                s += &format!(" reply_to={r}");
-            }
-            if let Some(e) = &n.effect {
-                s += &format!(" effect={e}");
-            }
-            if let Some(sub) = &n.subject {
-                s += &format!(" subject={sub:?}");
-            }
-            s
-        }
-        other => format!("[{}]", variant_name(other)),
-    };
-    let name = if name.is_empty() {
-        String::new()
-    } else {
-        format!(" name={name:?}")
-    };
-    log::info!(
-        "RECV id={} ts={} sender={:?} chat=[{participants}]{name} {body}",
+    format!(
+        "RECV id={} ts={} kind={} reply={reply} effect={effect} subject={subject} participants={participants}",
         inst.id,
         inst.sent_timestamp,
-        inst.sender,
-    );
+        variant_name(&inst.message),
+    )
 }
 
 fn variant_name(m: &Message) -> &'static str {
@@ -3006,7 +2997,7 @@ async fn download_inbound(
             })
         }).await {
             Ok(()) => {
-                log::info!("↓ saved attachment {} ({})", att.name, att.mime);
+                log::info!("↓ saved attachment {guid} part {part_index} ({})", att.mime);
                 out.push(AttachmentRecord {
                     guid: None,
                     mime: Some(att.mime.clone()),
@@ -3020,10 +3011,10 @@ async fn download_inbound(
                 });
             }
             Err(crate::attachment_cache::DownloadError::Download(e)) => {
-                log::warn!("download attachment {}: {e:?}", att.name);
+                log::warn!("download attachment {guid} part {part_index}: {e:?}");
             }
             Err(crate::attachment_cache::DownloadError::Io(e)) => {
-                log::warn!("io writing attachment {}: {e}", att.name);
+                log::warn!("io writing attachment {guid} part {part_index}: {e}");
             }
         }
     }
@@ -3510,6 +3501,66 @@ mod tests {
     //! existing per-module cfg convention.
     use super::*;
     use rustpush::AttachmentType;
+
+    /// The `RECV` line logged for every inbound message holds ids and shape
+    /// only: none of the message's text, subject, group name or handles.
+    #[test]
+    fn recv_log_line_has_no_message_content() {
+        let text = "meet at the blue door at nine";
+        let subject = "weekend plans";
+        let group_name = "Hiking Crew";
+        let sender = "tel:+15555550123";
+        let others = ["mailto:friend@example.com", "tel:+15555550199"];
+
+        let mut normal = NormalMessage::new(text.to_string(), MessageType::IMessage);
+        normal.subject = Some(subject.to_string());
+        normal.reply_guid = Some("REPLY-TARGET-GUID".to_string());
+        normal.effect = Some("com.apple.MobileSMS.expressivesend.impact".to_string());
+        let conversation = ConversationData {
+            participants: [sender, others[0], others[1]].map(String::from).to_vec(),
+            cv_name: Some(group_name.to_string()),
+            sender_guid: None,
+            after_guid: None,
+        };
+        let mut inst = MessageInst::new(conversation, sender, Message::Message(normal));
+        inst.id = "MSG-GUID-1".to_string();
+        inst.sent_timestamp = 1_763_400_000_000;
+
+        let line = recv_log_line(&inst);
+
+        for content in [text, subject, group_name, sender, others[0], others[1]] {
+            assert!(!line.contains(content), "log line leaks {content:?}: {line}");
+        }
+        // Spot-check the parts most likely to slip back in, case-insensitively.
+        let lower = line.to_lowercase();
+        for word in ["blue door", "weekend", "hiking", "5555550", "example.com"] {
+            assert!(!lower.contains(word), "log line leaks {word:?}: {line}");
+        }
+        assert_eq!(
+            line,
+            "RECV id=MSG-GUID-1 ts=1763400000000 kind=Message reply=true effect=true \
+             subject=true participants=3"
+        );
+    }
+
+    /// A group rename's new name is content too; only the kind is logged.
+    #[test]
+    fn recv_log_line_omits_rename_name() {
+        let conversation = ConversationData {
+            participants: vec!["tel:+15555550123".into(), "tel:+15555550199".into()],
+            cv_name: Some("Old Name".into()),
+            sender_guid: None,
+            after_guid: None,
+        };
+        let rename = rustpush::RenameMessage { new_name: "Secret Party Planning".into() };
+        let inst = MessageInst::new(conversation, "tel:+15555550123", Message::RenameMessage(rename));
+
+        let line = recv_log_line(&inst);
+
+        assert!(!line.contains("Secret Party"), "{line}");
+        assert!(!line.contains("Old Name"), "{line}");
+        assert!(line.contains("kind=Rename reply=false effect=false subject=false participants=2"), "{line}");
+    }
 
     /// Pin: the pure helper that builds the wire-level `ReactMessage` for
     /// `send_reaction`:
