@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use rustpush::cloud_messages::{
     CloudChat, CloudMessage, MessageFlags, cloudmessagesp::MessageProto,
 };
-use crate::store::{ChatRef, IncomingMessage, Ingest, Store, Tapback};
+use crate::store::{ChatRef, IncomingMessage, Ingest, Receipt, Store, Tapback};
 use async_trait::async_trait;
 use rustpush::PushError;
 
@@ -322,7 +322,16 @@ pub async fn process_sync_page(
     let mut result = ProcessPageResult::default();
 
     for (record_id, cm) in page {
+        // iCloud records whether we read an incoming message (on the phone,
+        // say). Without this, every synced conversation whose last word was
+        // theirs would show as unread here.
+        let read_elsewhere = cm.flags.contains(MessageFlags::IS_READ);
         let ingest = cloud_message_to_ingest(cm, my_handles, chat_map);
+        let read_receipt = match &ingest {
+            Ingest::Message(m) if read_elsewhere && !m.is_from_me => Some((m.guid.clone(), m.date)),
+            Ingest::Tapback(t) if read_elsewhere && !t.is_from_me => Some((t.guid.clone(), t.date)),
+            _ => None,
+        };
         if let Some(existing) = existing_chats {
             let chat_key = match &ingest {
                 Ingest::Message(m) => Some(m.chat.key()),
@@ -361,12 +370,21 @@ pub async fn process_sync_page(
             log::warn!("store.apply failed during sync: {e}");
             // Still count it as processed and check the cap — we don't
             // want to retry indefinitely on a persistent error.
-        } else if let Some(guid) = stored_guid.filter(|g| *g != record_id) {
-            if let Err(e) = store
-                .apply(Ingest::CloudRecordSeen { record_id: record_id.clone(), guid })
-                .await
-            {
-                log::warn!("store.apply cloud_record failed during sync: {e}");
+        } else {
+            if let Some(guid) = stored_guid.filter(|g| *g != record_id) {
+                if let Err(e) = store
+                    .apply(Ingest::CloudRecordSeen { record_id: record_id.clone(), guid })
+                    .await
+                {
+                    log::warn!("store.apply cloud_record failed during sync: {e}");
+                }
+            }
+            // The same path as our read receipt echoed from another device:
+            // clears unread through this message, and sends nothing.
+            if let Some((guid, date)) = read_receipt {
+                if let Err(e) = store.apply(Ingest::Receipt(Receipt::Read { guid, date })).await {
+                    log::warn!("store.apply read state failed during sync: {e}");
+                }
             }
         }
 
@@ -1611,6 +1629,56 @@ mod tests {
         (unix_ms - 978_307_200_000) * 1_000_000
     }
 
+    /// Pin: an incoming message (or tapback) iCloud marks read arrives read;
+    /// one it doesn't stays unread.
+    #[tokio::test]
+    async fn process_sync_page_applies_icloud_read_state() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::open(tmp.path().join("db.sqlite")).await.unwrap();
+        let now = now_apple_ns();
+        let hour = 3_600_000_000_000i64;
+        let in_chat = |guid: &str, handle: &str, t: i64, read: bool| {
+            let mut cm = make_cm(guid, handle, "hi", t);
+            cm.chat_id = format!("iMessage;-;{handle}");
+            cm.destination_caller_id = "me@example.com".into();
+            if read {
+                cm.flags |= MessageFlags::IS_READ;
+            }
+            cm
+        };
+        let mut tapback = in_chat("t1", "+15550123", now - hour, true);
+        tapback.msg_proto.text = None;
+        tapback.msg_proto.associated_message_guid = Some("someone-elses".into());
+        tapback.msg_proto.associated_message_type = Some(2000);
+
+        let mut page: HashMap<String, CloudMessage> = HashMap::new();
+        page.insert("a1".into(), in_chat("a1", "+15550100", now - 2 * hour, true));
+        page.insert("b1".into(), in_chat("b1", "+15550199", now - hour, false));
+        page.insert("t1".into(), tapback);
+        let result = process_sync_page(
+            page,
+            &["mailto:me@example.com".to_string()],
+            &HashMap::new(),
+            &store,
+            i64::MIN,
+            None,
+        )
+        .await;
+        assert_eq!(result.count, 3);
+
+        let chats = store.chats().await.unwrap();
+        let unread = |handle: &str| {
+            chats
+                .iter()
+                .find(|c| c.participants.iter().any(|p| p == handle))
+                .map(|c| c.unread)
+                .unwrap_or_else(|| panic!("no chat with {handle}"))
+        };
+        assert_eq!(unread("tel:+15550100"), 0, "read on the phone");
+        assert_eq!(unread("tel:+15550199"), 1, "not read anywhere");
+        assert_eq!(unread("tel:+15550123"), 0, "a tapback read on the phone");
+    }
+
     #[tokio::test]
     async fn process_sync_page_all_recent() {
         let tmp = tempfile::tempdir().unwrap();
@@ -2794,11 +2862,12 @@ pub struct SyncCursor {
     pub scan_version: u32,
 }
 
-/// Bumped when the initial scan files records differently enough that a
-/// finished scan must be redone once so stored messages move to the right
-/// conversation. 1: group messages keyed by group id (before, they were
-/// filed under the sender's 1:1).
-pub const SCAN_VERSION: u32 = 1;
+/// Bumped when the initial scan stores records differently enough that a
+/// finished scan must be redone once to correct what's already stored.
+/// 1: group messages keyed by group id (before, they were filed under the
+/// sender's 1:1). 2: iCloud's read state applied (before, every synced
+/// incoming message without a later reply showed as unread).
+pub const SCAN_VERSION: u32 = 2;
 
 /// The initial scan ran with an older [`SCAN_VERSION`].
 pub fn scan_is_outdated(cursor: &SyncCursor) -> bool {

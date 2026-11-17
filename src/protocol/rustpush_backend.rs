@@ -1943,7 +1943,7 @@ impl Backend for RustpushBackend {
         if crate::sync::needs_rescan(&cursor, bubbles_config.import_history, now_ms) {
             if crate::sync::scan_is_outdated(&cursor) {
                 log::info!(
-                    "the last scan used an older conversation mapping (version {} < {}); rescanning iCloud messages once",
+                    "the last scan was made by an older build (scan version {} < {}); rescanning iCloud messages once",
                     cursor.scan_version,
                     crate::sync::SCAN_VERSION
                 );
