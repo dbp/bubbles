@@ -171,12 +171,12 @@ fn pretty_addr(a: &str) -> String {
 ///
 /// 1. `chat.custom_name` (if non-empty after trimming).
 /// 2. `chat.display_name` (if non-empty — no trim).
-/// 3. If the chat has **exactly one** non-self participant, look up that
-///    participant's address via `find_contact` and return the contact's
-///    `display_name` if found. Group chats (2+ non-self) skip this step.
-/// 4. Non-self participants → `pretty_addr` each, joined by `", "`.
-/// 5. All participants → `pretty_addr` each, joined by `", "`.
-/// 6. `chat.key` (only when `participants` is empty).
+/// 3. Non-self participants, joined by `", "`: each one's contact
+///    `display_name` (via `find_contact`) when there is one, else
+///    `pretty_addr`. A 1:1 is just its one name; an unnamed group reads
+///    "Alice, Bob, +15555550100".
+/// 4. All participants → `pretty_addr` each, joined by `", "`.
+/// 5. `chat.key` (only when `participants` is empty).
 pub fn chat_display_title(
     chat: &ChatSummary,
     my_handles: &[String],
@@ -206,26 +206,19 @@ pub fn chat_display_title(
         .filter(|p| !is_me(p.as_str()))
         .collect();
 
-    // 3. Exactly one non-self → contact display name
-    if non_self.len() == 1 {
-        #[allow(clippy::collapsible_if)]
-        if let Some(contact) = find_contact(contacts, non_self[0]) {
-            if !contact.display_name.is_empty() {
-                return contact.display_name.clone();
-            }
-        }
-    }
-
-    // 4. Non-self participants → pretty_addr, join
+    // 3. Non-self participants → contact name, else pretty_addr, joined
     if !non_self.is_empty() {
         return non_self
             .iter()
-            .map(|a| pretty_addr(a))
+            .map(|a| match find_contact(contacts, a) {
+                Some(contact) if !contact.display_name.is_empty() => contact.display_name.clone(),
+                _ => pretty_addr(a),
+            })
             .collect::<Vec<_>>()
             .join(", ");
     }
 
-    // 5. All participants → pretty_addr, join
+    // 4. All participants → pretty_addr, join
     if !chat.participants.is_empty() {
         return chat
             .participants
@@ -235,7 +228,7 @@ pub fn chat_display_title(
             .join(", ");
     }
 
-    // 6. Empty participants → chat.key
+    // 5. Empty participants → chat.key
     chat.key.clone()
 }
 
@@ -350,7 +343,7 @@ impl ContactSource for CombinedContactSource {
             anyhow::bail!("{}", errors.join("; "));
         }
         for e in &errors {
-            eprintln!("contact source unavailable: {e}");
+            log::warn!("contact source unavailable: {e:#}");
         }
         Ok(contacts.into_iter().flatten().collect())
     }
@@ -892,8 +885,10 @@ mod tests {
         );
     }
 
+    /// Pin: an unnamed group is titled with its members' contact names (as
+    /// iMessage does), keeping the address for anyone not in contacts.
     #[test]
-    fn group_without_display_name_uses_pretty_addr_list_not_contacts() {
+    fn group_without_display_name_uses_contact_names() {
         let contacts = vec![
             Contact {
                 uid: "c1".into(),
@@ -931,11 +926,14 @@ mod tests {
             custom_name: None,
             custom_avatar_path: None,
         };
-        // Non-self participants (in order): tel:+15555550100 → "+15555550100",
-        //                                   mailto:bob@example.com → "bob@example.com"
+        assert_eq!(chat_display_title(&chat, &my_handles, &contacts), "Alice, Bob");
+
+        // Someone not in contacts keeps their number, in participant order.
+        let mut with_stranger = chat.clone();
+        with_stranger.participants.insert(2, "tel:+16175550199".into());
         assert_eq!(
-            chat_display_title(&chat, &my_handles, &contacts),
-            "+15555550100, bob@example.com",
+            chat_display_title(&with_stranger, &my_handles, &contacts),
+            "Alice, +16175550199, Bob",
         );
     }
 

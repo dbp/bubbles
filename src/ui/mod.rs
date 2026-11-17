@@ -1094,7 +1094,7 @@ pub fn enter_messaging(
                             ui_for_contacts.schedule_refresh();
                         }
                         Err(e) => {
-                            eprintln!("contact refresh failed: {e:#}");
+                            log::warn!("contact refresh failed: {e:#}");
                         }
                     }
                 },

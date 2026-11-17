@@ -1057,9 +1057,11 @@ pub fn upsert_contact(c: &Connection, contact: &Contact) -> rusqlite::Result<()>
         "DELETE FROM contact_address WHERE contact_uid = ?1",
         params![contact.uid],
     )?;
+    // A card can list one number twice (under two labels, say); the second
+    // copy adds nothing, and failing on it would stop the whole import.
     for addr in &contact.addresses {
         c.execute(
-            "INSERT INTO contact_address(contact_uid, value, kind) VALUES (?1, ?2, ?3)",
+            "INSERT OR IGNORE INTO contact_address(contact_uid, value, kind) VALUES (?1, ?2, ?3)",
             params![contact.uid, addr.value, addr.kind],
         )?;
     }
@@ -3249,6 +3251,23 @@ mod tests {
         let c = db();
         let got = lookup_contact_by_addr(&c, "tel:+15555550100").unwrap();
         assert!(got.is_none());
+    }
+
+    /// Pin: a card listing the same number twice is stored (once), instead
+    /// of failing and ending the import there.
+    #[test]
+    fn upsert_contact_with_a_repeated_number_succeeds() {
+        let c = db();
+        let phone = |v: &str| ContactAddress { value: v.into(), kind: "phone".into() };
+        let contact = Contact {
+            uid: "twice".into(),
+            display_name: "Twice Listed".into(),
+            avatar: None,
+            addresses: vec![phone("tel:(401) 555-0100"), phone("tel:(401) 555-0100")],
+        };
+        upsert_contact(&c, &contact).unwrap();
+        let got = lookup_contact_by_addr(&c, "tel:(401) 555-0100").unwrap().expect("stored");
+        assert_eq!(got.addresses.len(), 1);
     }
 
     #[test]
