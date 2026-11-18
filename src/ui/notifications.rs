@@ -58,12 +58,16 @@ impl super::Ui {
 
                 let open_id = ui.open_summary.borrow().as_ref().map(|c| c.id);
                 let focused = ui.focused.get();
+                let visible = ui.window.borrow().as_ref().is_some_and(|w| w.is_visible());
                 let now = std::time::Instant::now();
                 for chat_id in order {
                     let (sender, preview, count) = per_chat.remove(&chat_id).unwrap();
                     let last_msg = last_msg_per_chat.remove(&chat_id).unwrap();
                     // Don't notify for the chat the user is actively viewing.
                     if focused && open_id == Some(chat_id) {
+                        log::info!(
+                            "notify: chat {chat_id}: {count} new, not shown: it is open in the focused window"
+                        );
                         ui.withdraw_chat_notification(chat_id);
                         ui.pending_notifications.borrow_mut().cancel(chat_id);
                         continue;
@@ -88,9 +92,15 @@ impl super::Ui {
                         .insert_or_replace(chat_id, last_msg, now)
                     {
                         pending::InsertResult::Fire(_) => {
+                            log::info!("notify: chat {chat_id}: {count} new, showing now");
                             ui.show_chat_notification(chat_id, &title, &body);
                         }
                         pending::InsertResult::Schedule(at) => {
+                            log::info!(
+                                "notify: chat {chat_id}: {count} new, showing in {} ms unless read first (window focused: {focused}, visible: {visible}, open chat: {})",
+                                at.saturating_duration_since(now).as_millis(),
+                                open_id.map_or("none".to_string(), |id| id.to_string()),
+                            );
                             let pending = ui.pending_notifications.clone();
                             let ui2 = ui.clone();
                             glib::timeout_add_local_once(
@@ -105,7 +115,8 @@ impl super::Ui {
                                                 store.latest_unread_incoming(cid).await
                                             },
                                             move |result| {
-                                                if result.ok().flatten().is_some() {
+                                                match result {
+                                                Ok(Some(_)) => {
                                                     // Chat is still unread — show notification.
                                                     let preview = entry
                                                         .last_message
@@ -153,8 +164,20 @@ impl super::Ui {
                                                         cid, &title, &body,
                                                     );
                                                 }
+                                                Ok(None) => log::info!(
+                                                    "notify: chat {cid}: not shown: read before the wait ended"
+                                                ),
+                                                Err(e) => log::warn!(
+                                                    "notify: chat {cid}: not shown: unread check failed: {e:#}"
+                                                ),
+                                                }
                                             },
                                         );
+                                    } else {
+                                        // A newer message already took this
+                                        // chat's pending entry (or opening the
+                                        // chat cancelled it).
+                                        log::debug!("notify: chat {chat_id}: wait ended, nothing pending");
                                     }
                                 },
                             );
@@ -167,6 +190,7 @@ impl super::Ui {
 
     pub(super) fn show_chat_notification(&self, chat_id: i64, title: &str, body: &str) {
         let Some(app) = gtk::gio::Application::default() else {
+            log::warn!("notify: chat {chat_id}: not shown: no application to send it from");
             return;
         };
         let n = gtk::gio::Notification::new(title);
@@ -175,15 +199,26 @@ impl super::Ui {
         }
         n.set_default_action_and_target_value("app.open-chat", Some(&chat_id.to_variant()));
         app.send_notification(Some(&format!("chat-{chat_id}")), &n);
+        log::info!("notify: chat {chat_id}: sent to the desktop");
         self.notified_chats.borrow_mut().insert(chat_id);
         crate::tray::set_unread(true);
     }
 
+    /// Withdraws the chat's notification. Logs who withdrew it (the caller's
+    /// file and line), so a notification that vanished can be traced.
+    #[track_caller]
     pub(super) fn withdraw_chat_notification(&self, chat_id: i64) {
         if let Some(app) = gtk::gio::Application::default() {
             app.withdraw_notification(&format!("chat-{chat_id}"));
         }
-        self.notified_chats.borrow_mut().remove(&chat_id);
+        if self.notified_chats.borrow_mut().remove(&chat_id) {
+            let at = std::panic::Location::caller();
+            log::info!(
+                "notify: chat {chat_id}: withdrawn (by {}:{})",
+                at.file(),
+                at.line()
+            );
+        }
         crate::tray::set_unread(!self.notified_chats.borrow().is_empty());
     }
 
