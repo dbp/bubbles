@@ -657,6 +657,7 @@ version = "0.1.0"
 dependencies = [
  "base64 0.21.7",
  "disjoint_impls",
+ "log",
  "plist",
  "prost",
  "prost-build",

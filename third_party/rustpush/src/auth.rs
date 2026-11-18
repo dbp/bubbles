@@ -1309,8 +1309,6 @@ impl<P: AnisetteProvider> CircleServerSession<P> {
                     }.encode_to_vec().into()) } else { None }
                 }).unwrap();
 
-                println!("Body {}", encode_hex(&step1));
-
                 self.account.lock().await.circle(&CircleSendMessage {
                     atxid: request.atxnid.clone(),
                     circlestep: 1,

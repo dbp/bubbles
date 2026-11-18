@@ -323,6 +323,10 @@ pub struct ProcessPageResult {
     /// Records skipped because their conversation is not in the sidebar
     /// (the "only sync existing conversations" preference).
     pub filtered: usize,
+    /// Records skipped as neither a message with text nor a tapback, by
+    /// CloudKit `msgType` (0 is an ordinary message; other types, such as
+    /// group membership changes, keep something else in `msgProto`).
+    pub skipped_by_type: std::collections::BTreeMap<i64, usize>,
 }
 
 /// Process one page of CloudKit sync results: translate each `CloudMessage`
@@ -352,6 +356,7 @@ pub async fn process_sync_page(
         // say). Without this, every synced conversation whose last word was
         // theirs would show as unread here.
         let read_elsewhere = cm.flags.contains(MessageFlags::IS_READ);
+        let msg_type = cm.r#type;
         let ingest = cloud_message_to_ingest(cm, my_handles, chat_map);
         let read_receipt = match &ingest {
             Ingest::Message(m) if read_elsewhere && !m.is_from_me => Some((m.guid.clone(), m.date)),
@@ -389,6 +394,7 @@ pub async fn process_sync_page(
 
         // Ignored records don't count.
         if matches!(ingest, Ingest::Ignored(_)) {
+            *result.skipped_by_type.entry(msg_type).or_default() += 1;
             continue;
         }
 
@@ -574,6 +580,22 @@ pub struct SyncResult {
     /// True when the message zone has been walked to its end, i.e. the saved
     /// token now means "now" and later runs are incremental.
     pub scan_complete: bool,
+    /// Records skipped as neither a message nor a tapback, by `msgType`
+    /// (see [`ProcessPageResult::skipped_by_type`]).
+    pub skipped_by_type: std::collections::BTreeMap<i64, usize>,
+    /// CloudKit fields that did not match their schema and were read as
+    /// empty during this session (counted by `cloudkit_proto`; their bytes
+    /// are never logged).
+    pub undecodable_fields: u64,
+}
+
+impl SyncResult {
+    /// Fold one page's skipped-record counts into the session's.
+    fn add_skipped(&mut self, page: &ProcessPageResult) {
+        for (msg_type, n) in &page.skipped_by_type {
+            *self.skipped_by_type.entry(*msg_type).or_default() += n;
+        }
+    }
 }
 
 impl SyncResult {
@@ -649,6 +671,7 @@ pub async fn sync_once(
         )
         .await;
         result.messages_processed += page_result.count;
+        result.add_skipped(&page_result);
 
         if page_result.any_older_than_cutoff {
             result.cap_hit = true;
@@ -1749,6 +1772,36 @@ mod tests {
         assert_eq!(unread("tel:+15550123"), 0, "a tapback read on the phone");
     }
 
+    /// Pin: a record that is neither a message with text nor a tapback is
+    /// skipped and counted under its CloudKit `msgType`, so a sync can say
+    /// in one line what it passed over. A group membership change (its
+    /// `msgProto` has a different layout and reads as empty) is the case
+    /// seen in practice.
+    #[tokio::test]
+    async fn process_sync_page_counts_skipped_records_by_msg_type() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::open(tmp.path().join("db.sqlite")).await.unwrap();
+        let now = now_apple_ns();
+        let mut membership = make_cm("g1", "+15550100", "unused", now);
+        membership.r#type = 1;
+        membership.msg_proto = GZipWrapper(MessageProto::default());
+        let mut empty = make_cm("e1", "+15550101", "unused", now);
+        empty.msg_proto.text = None;
+
+        let mut page: HashMap<String, CloudMessage> = HashMap::new();
+        page.insert("g1".into(), membership);
+        page.insert("e1".into(), empty);
+        page.insert("m1".into(), make_cm("m1", "+15550102", "hi", now));
+        let result =
+            process_sync_page(page, &[], &HashMap::new(), &store, i64::MIN, None).await;
+
+        assert_eq!(result.count, 1, "only the real message is stored");
+        assert_eq!(
+            result.skipped_by_type,
+            std::collections::BTreeMap::from([(0, 1), (1, 1)])
+        );
+    }
+
     #[tokio::test]
     async fn process_sync_page_all_recent() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1786,6 +1839,7 @@ mod tests {
                 count: 2,
                 any_older_than_cutoff: false,
                 filtered: 0,
+                ..Default::default()
             }
         );
     }
@@ -1837,6 +1891,7 @@ mod tests {
                 count: 3,
                 any_older_than_cutoff: true,
                 filtered: 0,
+                ..Default::default()
             }
         );
     }
@@ -1865,6 +1920,7 @@ mod tests {
                 count: 0,
                 any_older_than_cutoff: false,
                 filtered: 0,
+                ..Default::default()
             }
         );
     }
@@ -3306,6 +3362,7 @@ pub async fn sync_messages_with_cursor(
         )
         .await;
         result.messages_processed += page_result.count;
+        result.add_skipped(&page_result);
         result.filtered += page_result.filtered;
         result.scanned += skipped;
         cursor.records_scanned += (skipped + live_count + tombstone_count) as u64;

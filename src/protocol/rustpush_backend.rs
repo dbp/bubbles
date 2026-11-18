@@ -2105,6 +2105,25 @@ impl Backend for RustpushBackend {
             },
         )
         .await;
+        let mut result = result;
+        // Records CloudKit holds that are not messages we can show (group
+        // membership changes keep a differently shaped `msgProto`, which
+        // rustpush reads as empty): one counted line per sync, no bytes.
+        result.undecodable_fields = rustpush::cloudkit_proto::take_decode_failures();
+        let unusual: std::collections::BTreeMap<i64, usize> = result
+            .skipped_by_type
+            .iter()
+            .filter(|(msg_type, _)| **msg_type != 0)
+            .map(|(t, n)| (*t, *n))
+            .collect();
+        if result.undecodable_fields > 0 || !unusual.is_empty() {
+            log::info!(
+                "cloud sync: {} record fields did not match their schema and were read as empty; \
+                 skipped records by msgType {:?}",
+                result.undecodable_fields,
+                result.skipped_by_type
+            );
+        }
         // The catch-up gate counts from the last clean sync, so a launch or
         // wake right after one does not sign in to iCloud again. Stamped with
         // the start time: a change made while this run was paging may not be

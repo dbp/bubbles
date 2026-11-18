@@ -124,7 +124,15 @@ disjoint_impls! {
         fn from_bytes(v: Vec<u8>) -> Self {
             let result = Self::decode(&v[..]);
             if let Err(e) = &result {
-                println!("Failed to decode proto {} {}", encode_hex(&v), e);
+                // Never the bytes themselves: these fields hold handles and
+                // message text. prost's error names the field and the wire
+                // type, not the value.
+                crate::DECODE_FAILURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                log::debug!(
+                    "{} did not decode ({e}); read as empty. Wire shape: {}",
+                    std::any::type_name::<Self>(),
+                    crate::proto_wire_shape(&v)
+                );
             }
             result.unwrap_or_default()
         }
@@ -135,7 +143,15 @@ disjoint_impls! {
 
     impl<T: Serialize + DeserializeOwned + CloudKitBytesKind<Kind = sealed::PlistKind>> CloudKitBytes for T {
         fn from_bytes(v: Vec<u8>) -> Self {
-            plist::from_bytes(&v).expect(&format!("Deserialization failed! {}", encode_hex(&v)))
+            // The panic message carries neither the bytes nor plist's error,
+            // which can quote the offending value.
+            plist::from_bytes(&v).unwrap_or_else(|_| {
+                panic!(
+                    "{} plist did not deserialize ({} bytes)",
+                    std::any::type_name::<Self>(),
+                    v.len()
+                )
+            })
         }
 
         fn to_bytes(&self) -> Vec<u8> {
@@ -236,6 +252,110 @@ impl CloudKitEncryptedValue for SystemTime {
         let d = record::field::EncryptedValue::decode(&encryptor.decrypt_data(value.bytes_value.as_ref().unwrap(), field_name)[..]).unwrap().date_value.unwrap();
         let secs = d.time.expect("Date misses time??");
         Some(SystemTime::UNIX_EPOCH + Duration::from_secs_f64(secs + 978307200f64))
+    }
+}
+
+/// CloudKit fields that failed to decode against their schema (and were read
+/// as the type's default) since the last [`take_decode_failures`].
+static DECODE_FAILURES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Take and reset the count of fields that failed to decode, so a caller
+/// can report them in one line per sync instead of one per record.
+pub fn take_decode_failures() -> u64 {
+    DECODE_FAILURES.swap(0, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The top-level protobuf layout of `bytes`: each field's number and wire
+/// type, and the length of length-delimited ones. Never a value: this is
+/// what a log line may say about a CloudKit field, which holds handles and
+/// message text. Example: `27 bytes [1:varint 2:varint 3:len(12)]`.
+pub fn proto_wire_shape(bytes: &[u8]) -> String {
+    fn varint(b: &[u8], pos: &mut usize) -> Option<u64> {
+        let mut value = 0u64;
+        for shift in (0..64).step_by(7) {
+            let byte = *b.get(*pos)?;
+            *pos += 1;
+            value |= u64::from(byte & 0x7f) << shift;
+            if byte & 0x80 == 0 {
+                return Some(value);
+            }
+        }
+        None
+    }
+    const MAX_FIELDS: usize = 24;
+    let mut fields: Vec<String> = Vec::new();
+    let mut pos = 0usize;
+    while pos < bytes.len() {
+        if fields.len() == MAX_FIELDS {
+            fields.push("...".into());
+            break;
+        }
+        let Some(key) = varint(bytes, &mut pos) else {
+            fields.push("malformed".into());
+            break;
+        };
+        let number = key >> 3;
+        let shape = match key & 7 {
+            0 => varint(bytes, &mut pos).map(|_| "varint".to_string()),
+            1 => {
+                pos += 8;
+                Some("i64".into())
+            }
+            2 => varint(bytes, &mut pos).map(|len| {
+                pos = pos.saturating_add(len as usize);
+                format!("len({len})")
+            }),
+            5 => {
+                pos += 4;
+                Some("i32".into())
+            }
+            wire => {
+                fields.push(format!("{number}:wire{wire}"));
+                break;
+            }
+        };
+        match shape {
+            Some(shape) if pos <= bytes.len() => fields.push(format!("{number}:{shape}")),
+            Some(shape) => {
+                fields.push(format!("{number}:{shape} truncated"));
+                break;
+            }
+            None => {
+                fields.push(format!("{number}:malformed"));
+                break;
+            }
+        }
+    }
+    format!("{} bytes [{}]", bytes.len(), fields.join(" "))
+}
+
+#[cfg(test)]
+mod wire_shape_tests {
+    use super::proto_wire_shape;
+
+    /// Pin: the shape names fields, wire types and lengths, never values.
+    /// This is the layout of the record reported from a real sync: an
+    /// unsigned 1, an unsigned 0 and a 12-byte string (a phone number).
+    #[test]
+    fn shape_has_no_values() {
+        let mut bytes = vec![0x08, 0x01, 0x10, 0x00, 0x1a, 12];
+        bytes.extend_from_slice(b"+15555550123");
+        let shape = proto_wire_shape(&bytes);
+        assert_eq!(shape, "18 bytes [1:varint 2:varint 3:len(12)]");
+        assert!(!shape.contains("555"));
+    }
+
+    #[test]
+    fn shape_marks_truncated_and_malformed_input() {
+        assert_eq!(proto_wire_shape(&[0x1a, 0x05, b'a']), "3 bytes [3:len(5) truncated]");
+        assert_eq!(proto_wire_shape(&[0x08, 0xff]), "2 bytes [1:malformed]");
+        assert_eq!(proto_wire_shape(&[]), "0 bytes []");
+    }
+
+    #[test]
+    fn shape_reads_fixed_width_fields() {
+        let bytes = [0x09, 0, 0, 0, 0, 0, 0, 0, 0, 0x15, 0, 0, 0, 0];
+        assert_eq!(proto_wire_shape(&bytes), "14 bytes [1:i64 2:i32]");
     }
 }
 
