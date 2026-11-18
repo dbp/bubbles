@@ -284,12 +284,30 @@ pub(super) fn clear_box(b: &gtk::Box) {
     }
 }
 
+/// Whether the sidebar shows "Syncing with iCloud…" for a sync that has run
+/// for `active_for`. The periodic catch-up finishes in seconds every quarter
+/// hour and would only flash it, so the banner waits for a scan (which has
+/// progress to show) or a sync that is taking a while.
+pub(crate) fn show_sync_banner(scanning: bool, active_for: std::time::Duration) -> bool {
+    scanning || active_for >= std::time::Duration::from_secs(10)
+}
+
 // ── Tests ──────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    /// Pin: a scan shows the sync banner at once; a routine catch-up only
+    /// once it has run for ten seconds, so a quick one never flashes it.
+    #[test]
+    fn sync_banner_waits_for_a_scan_or_a_slow_sync() {
+        use std::time::Duration;
+        assert!(show_sync_banner(true, Duration::ZERO));
+        assert!(!show_sync_banner(false, Duration::from_secs(6)));
+        assert!(show_sync_banner(false, Duration::from_secs(10)));
+    }
 
     #[test]
     fn reply_snippets_are_one_short_line() {

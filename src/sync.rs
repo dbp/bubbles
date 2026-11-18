@@ -752,14 +752,58 @@ pub async fn wait_for_network(max_wait: std::time::Duration) -> bool {
     }
 }
 
-/// Decide whether to run a CloudKit sync based on the gap since the last
-/// alive timestamp. Returns `true` if `last_alive_ms` is `None` (first
-/// launch) or `now_ms - last_alive_ms > threshold_ms`.
-pub fn should_sync(last_alive_ms: Option<i64>, now_ms: i64, threshold_ms: i64) -> bool {
-    match last_alive_ms {
-        None => true,
-        Some(last) => now_ms.saturating_sub(last) > threshold_ms,
-    }
+// ---------------------------------------------------------------------------
+// Catch-up sync
+// ---------------------------------------------------------------------------
+
+/// How often the automatic catch-up sync runs while the app is up, and how
+/// recent a successful sync has to be for launch or wake to skip one.
+///
+/// Push alone is not enough. A message that reaches the phone but not this
+/// device (sent while it slept or was restarting, or by a sender whose
+/// device list predates this registration) is never pushed again. Only a
+/// cloud sync brings it in, and the sync is incremental (a change token),
+/// so a run with nothing new costs a couple of requests.
+pub const CATCH_UP_INTERVAL_MS: i64 = 15 * 60 * 1000;
+
+/// File holding the unix ms at which the last cloud sync finished without
+/// an error (lives in `<state_dir>/last_cloud_sync`).
+pub const LAST_CLOUD_SYNC_FILENAME: &str = "last_cloud_sync";
+
+/// Record that a cloud sync just finished cleanly.
+pub fn write_last_cloud_sync(state_dir: &Path, unix_ms: i64) -> io::Result<()> {
+    fs::write(state_dir.join(LAST_CLOUD_SYNC_FILENAME), format!("{unix_ms}\n"))
+}
+
+/// When the last clean cloud sync finished, or `None` if none is recorded.
+pub fn read_last_cloud_sync(state_dir: &Path) -> Option<i64> {
+    let contents = fs::read_to_string(state_dir.join(LAST_CLOUD_SYNC_FILENAME)).ok()?;
+    contents.trim().parse::<i64>().ok()
+}
+
+/// Whether an automatic catch-up sync should start now.
+///
+/// * `last_success_ms` — the persisted [`LAST_CLOUD_SYNC_FILENAME`] stamp.
+///   A clean sync less than `interval_ms` ago means there is nothing to
+///   catch up on yet (unless `scan_pending`: an unfinished initial scan
+///   always continues).
+/// * `last_attempt_ms` — when this process last started one, whatever the
+///   outcome. Only the periodic timer passes it, so a sync that keeps
+///   failing is retried once per interval instead of on every tick. Launch
+///   and wake pass `None`: they are rare, and come exactly when a retry is
+///   likely to work.
+///
+/// A stamp in the future (the clock moved back) counts as stale, so it
+/// cannot silence catch-up until the clock catches up with it.
+pub fn catch_up_due(
+    last_success_ms: Option<i64>,
+    last_attempt_ms: Option<i64>,
+    scan_pending: bool,
+    now_ms: i64,
+    interval_ms: i64,
+) -> bool {
+    let fresh = |stamp: Option<i64>| stamp.is_some_and(|t| (0..interval_ms).contains(&(now_ms - t)));
+    (scan_pending || !fresh(last_success_ms)) && !fresh(last_attempt_ms)
 }
 
 // ---------------------------------------------------------------------------
@@ -2093,20 +2137,56 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------------
-    // should_sync tests
+    // catch-up sync tests
     // ---------------------------------------------------------------------------
 
+    /// Pin: a catch-up runs when no clean sync is on record, and when the
+    /// last one is at least the interval old; it does not when it is fresher.
     #[test]
-    fn should_sync_threshold_logic() {
-        assert!(should_sync(None, 1_000_000, 7_200_000));
-        assert!(!should_sync(Some(1_000_000), 1_001_000, 7_200_000));
-        assert!(should_sync(Some(1_000_000), 1_000_000 + 7_200_001, 7_200_000));
-        assert!(!should_sync(Some(1_000_000), 1_000_000 + 7_200_000, 7_200_000));
+    fn catch_up_due_after_the_interval() {
+        let i = CATCH_UP_INTERVAL_MS;
+        let t = 1_000_000;
+        assert!(catch_up_due(None, None, false, t, i));
+        assert!(!catch_up_due(Some(t), None, false, t, i));
+        assert!(!catch_up_due(Some(t), None, false, t + i - 1, i));
+        assert!(catch_up_due(Some(t), None, false, t + i, i));
+    }
+
+    /// Pin: an unfinished initial scan continues however recent the last
+    /// clean sync was.
+    #[test]
+    fn catch_up_due_while_the_initial_scan_is_pending() {
+        let t = 1_000_000;
+        assert!(catch_up_due(Some(t), None, true, t + 1, CATCH_UP_INTERVAL_MS));
+    }
+
+    /// Pin: the periodic timer retries a failing sync once per interval, not
+    /// on every tick, even when no sync has ever succeeded or a scan is
+    /// pending.
+    #[test]
+    fn catch_up_waits_out_a_recent_attempt() {
+        let i = CATCH_UP_INTERVAL_MS;
+        let t = 1_000_000;
+        assert!(!catch_up_due(None, Some(t), false, t + 60_000, i));
+        assert!(!catch_up_due(None, Some(t), true, t + 60_000, i));
+        assert!(catch_up_due(None, Some(t), false, t + i, i));
+    }
+
+    /// Pin: a stamp from the future (the clock moved back) does not silence
+    /// catch-up until the clock catches up with it.
+    #[test]
+    fn catch_up_due_when_the_clock_moved_back() {
+        let i = CATCH_UP_INTERVAL_MS;
+        assert!(catch_up_due(Some(5_000_000), None, false, 1_000_000, i));
+        assert!(catch_up_due(None, Some(5_000_000), false, 1_000_000, i));
     }
 
     #[test]
-    fn should_sync_zero_threshold() {
-        assert!(should_sync(Some(1_000_000), 1_000_001, 0));
+    fn last_cloud_sync_round_trips_and_is_none_when_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert_eq!(read_last_cloud_sync(tmp.path()), None);
+        write_last_cloud_sync(tmp.path(), 1_794_942_000_000).unwrap();
+        assert_eq!(read_last_cloud_sync(tmp.path()), Some(1_794_942_000_000));
     }
 
     // ---------------------------------------------------------------------------

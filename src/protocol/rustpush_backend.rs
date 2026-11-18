@@ -89,6 +89,10 @@ pub struct RustpushBackend {
     /// an auth cert and register in whichever order the network decides,
     /// and the loser is rejected as superseded.
     heal_lock: Mutex<()>,
+    /// Serialises cloud syncs. Launch, wake, the periodic catch-up, a
+    /// drop-triggered backfill and Sync Now can all start one; two at once
+    /// would read the same cursor and race to write it back.
+    sync_lock: Mutex<()>,
 }
 
 /// Marks a cloud sync as running for its whole duration, including every
@@ -124,6 +128,7 @@ impl RustpushBackend {
             conn: StdMutex::new(None),
             sync_progress: Arc::new(StdMutex::new(SyncProgress::default())),
             heal_lock: Mutex::new(()),
+            sync_lock: Mutex::new(()),
         }
     }
 
@@ -264,7 +269,14 @@ impl RustpushBackend {
                 log::warn!("reconstruct_account: try_auth failed: {e:?}");
                 // Anisette is still set; account is not. Subsequent attempts
                 // can reuse the anisette.
-                record_sync_error(&state_dir);
+                //
+                // The backoff is there so a password Apple rejects is not
+                // retried for a day. A login that never reached Apple (no
+                // network yet after resume, a DNS blip) is no reason to stop
+                // automatic syncs; the next one simply tries again.
+                if login_failure_needs_backoff(&format!("{e:?}")) {
+                    record_sync_error(&state_dir);
+                }
                 Err(format!("{APPLE_LOGIN_FAILED_PREFIX}: {e:#}"))
             }
         }
@@ -620,6 +632,13 @@ fn registration_is_healthy(imclient: &Arc<IMClient>) -> bool {
         *imclient.identity.resource_state.borrow(),
         rustpush::ResourceState::Generated
     )
+}
+
+/// Whether a failed Apple ID login (its `Debug` text) should start the
+/// automatic-sync backoff: yes when Apple answered and refused, no when the
+/// request never got through.
+fn login_failure_needs_backoff(error: &str) -> bool {
+    !crate::sync::is_connectivity_error(error)
 }
 
 /// Stamp `last_sync_error` with "now" so the automatic launch/wake sync backs
@@ -1809,6 +1828,9 @@ impl Backend for RustpushBackend {
         cutoff_ms: i64,
         force: bool,
     ) -> crate::sync::SyncResult {
+        // One sync at a time; a second caller waits and then runs its own
+        // (incremental, so it only fetches what the first left).
+        let _serial = self.sync_lock.lock().await;
         // Shows "syncing" in the sidebar until this function returns, by any
         // path.
         let _active = SyncActiveGuard::begin(&self.sync_progress);
@@ -2067,7 +2089,7 @@ impl Backend for RustpushBackend {
             chat_map: &chat_map,
             existing_chats: existing_chats.as_ref(),
         };
-        crate::sync::sync_messages_with_cursor(
+        let result = crate::sync::sync_messages_with_cursor(
             &fetcher,
             store,
             &scope,
@@ -2082,7 +2104,17 @@ impl Backend for RustpushBackend {
                 p.records_scanned = c.records_scanned;
             },
         )
-        .await
+        .await;
+        // The catch-up gate counts from the last clean sync, so a launch or
+        // wake right after one does not sign in to iCloud again. Stamped with
+        // the start time: a change made while this run was paging may not be
+        // in it.
+        if result.error.is_none() {
+            if let Err(e) = crate::sync::write_last_cloud_sync(&dir, now_ms) {
+                log::warn!("cannot record the last cloud sync time: {e}");
+            }
+        }
+        result
     }
 
     fn sync_progress(&self) -> SyncProgress {
@@ -3510,6 +3542,20 @@ mod tests {
     //! existing per-module cfg convention.
     use super::*;
     use rustpush::AttachmentType;
+
+    /// Pin: a login that never reached Apple does not stop automatic syncs
+    /// for a day; one Apple refused does. Without this, a single DNS blip at
+    /// the first sync after launch or resume silenced the periodic catch-up
+    /// (and the wake path's own retry) until the next day.
+    #[test]
+    fn only_a_refused_login_starts_the_sync_backoff() {
+        let dns = r#"ReqwestError(reqwest::Error { kind: Request, url: "https://gsa.apple.com/grandslam/GsService2", source: hyper::Error(Connect, ConnectError("dns error", Custom { kind: Uncategorized, error: "failed to lookup address information: Temporary failure in name resolution" })) })"#;
+        assert!(!login_failure_needs_backoff(dns));
+        assert!(!login_failure_needs_backoff("ErrorGettingAnisette(ReqwestError(..))"));
+        assert!(login_failure_needs_backoff(
+            "AuthSrpWithMessage(-22406, \"Enter the correct password for this Apple Account.\")"
+        ));
+    }
 
     /// The `RECV` line logged for every inbound message holds ids and shape
     /// only: none of the message's text, subject, group name or handles.

@@ -482,6 +482,95 @@ struct Ui {
 
 /// Swap the window over to the messaging UI and start receiving. Called once a
 /// live session exists (restored or freshly registered).
+/// What started an automatic catch-up sync. Only the log and the retry
+/// policy differ.
+#[cfg(feature = "rustpush")]
+#[derive(Clone, Copy, Debug)]
+enum CatchUpTrigger {
+    Launch,
+    Wake,
+    Periodic,
+}
+
+/// When this process last started a catch-up sync (unix ms, 0 = never), so
+/// the periodic timer retries a failing sync once per interval.
+#[cfg(feature = "rustpush")]
+static LAST_CATCH_UP_ATTEMPT_MS: std::sync::atomic::AtomicI64 =
+    std::sync::atomic::AtomicI64::new(0);
+
+/// Everything an automatic catch-up sync needs, cloned into each trigger.
+#[cfg(feature = "rustpush")]
+#[derive(Clone)]
+struct CatchUp {
+    backend: Arc<dyn Backend>,
+    store: Store,
+    /// The receive loop's event channel: a sync that stored anything pulses
+    /// the UI through it, as a pushed message would.
+    notify: async_channel::Sender<RecvEvent>,
+}
+
+#[cfg(feature = "rustpush")]
+impl CatchUp {
+    /// Pull from iCloud whatever push did not deliver, if
+    /// [`crate::sync::catch_up_due`] says one is due.
+    async fn run(&self, trigger: CatchUpTrigger) {
+        let state_dir = glib::user_data_dir().join("bubbles");
+        let now = now_ms();
+        let last_success = crate::sync::read_last_cloud_sync(&state_dir);
+        let last_attempt = match trigger {
+            CatchUpTrigger::Periodic => {
+                Some(LAST_CATCH_UP_ATTEMPT_MS.load(Ordering::Relaxed)).filter(|t| *t > 0)
+            }
+            CatchUpTrigger::Launch | CatchUpTrigger::Wake => None,
+        };
+        let scan_pending = crate::sync::scan_pending(&state_dir);
+        if !crate::sync::catch_up_due(
+            last_success,
+            last_attempt,
+            scan_pending,
+            now,
+            crate::sync::CATCH_UP_INTERVAL_MS,
+        ) {
+            if !matches!(trigger, CatchUpTrigger::Periodic) {
+                log::info!(
+                    "catch-up sync ({trigger:?}): skipped, last clean sync {} s ago",
+                    last_success.map_or(-1, |t| (now - t) / 1000)
+                );
+            }
+            return;
+        }
+        LAST_CATCH_UP_ATTEMPT_MS.store(now, Ordering::Relaxed);
+
+        // Resume fires before Wi-Fi has re-associated; a sync started in that
+        // gap fails on its first lookup.
+        let after_resume = matches!(trigger, CatchUpTrigger::Wake);
+        if after_resume && !crate::sync::wait_for_network(std::time::Duration::from_secs(60)).await {
+            log::warn!("catch-up sync ({trigger:?}): network not back after 60s; trying anyway");
+        }
+        // Only an unfinished initial scan looks at the cutoff; keep it where
+        // the launch sync always had it.
+        let day2 = 48 * 60 * 60 * 1000;
+        let cutoff_ms = crate::sync::read_last_alive(&state_dir)
+            .unwrap_or(now - day2)
+            .max(now - day2);
+        let mut result = self.backend.sync_missed_messages(&self.store, cutoff_ms, false).await;
+        if after_resume
+            && result.error.as_deref().is_some_and(crate::sync::is_connectivity_error)
+        {
+            log::warn!(
+                "catch-up sync ({trigger:?}): connectivity failure ({}); retrying in 15s",
+                result.error.as_deref().unwrap_or_default()
+            );
+            tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+            result = self.backend.sync_missed_messages(&self.store, cutoff_ms, false).await;
+        }
+        log::info!("catch-up sync ({trigger:?}): {result:?}");
+        if result.messages_processed > 0 || result.deleted > 0 {
+            let _ = self.notify.send(RecvEvent::Applied).await;
+        }
+    }
+}
+
 pub fn enter_messaging(
     nav: &adw::NavigationView,
     backend: &Arc<dyn Backend>,
@@ -570,12 +659,22 @@ pub fn enter_messaging(
         let status = sync_status.clone();
         let label = sync_status_label.clone();
         let bar = sync_status_bar.clone();
+        let active_since: Cell<Option<std::time::Instant>> = Cell::new(None);
         glib::timeout_add_local(std::time::Duration::from_millis(500), move || {
             let p = backend.sync_progress();
             if !p.active {
+                active_since.set(None);
                 if status.is_visible() {
                     status.set_visible(false);
                 }
+                return glib::ControlFlow::Continue;
+            }
+            let started = active_since.get().unwrap_or_else(|| {
+                let now = std::time::Instant::now();
+                active_since.set(Some(now));
+                now
+            });
+            if !show_sync_banner(p.scanning, started.elapsed()) {
                 return glib::ControlFlow::Continue;
             }
             // One short line that fits the sidebar at any width; the bar
@@ -1314,101 +1413,58 @@ pub fn enter_messaging(
 
     // Receive loop -> persist -> pulse -> refresh.
     let (tx, rx) = async_channel::unbounded::<RecvEvent>();
+    #[cfg(feature = "rustpush")]
+    let catch_up_notify = tx.clone();
     let kick = backend.start_receiving(&connection, &client, handles, store.clone(), tx);
     // Wire the wake-from-sleep handler to the receive loop's kick signal.
     crate::power::wire_wake_to_receive_loop(monitor, std::sync::Arc::clone(&kick));
 
-    // --- Threshold-gated launch sync ---
-    // Run on launch when the gap since `last_alive` exceeds 2 hours.
-    // On first launch the file doesn't exist → gap = ∞ → sync runs.
+    // --- Catch-up sync: launch, wake, and every few minutes ---
+    // Push misses messages: whatever reached the phone while this device
+    // slept, restarted or was left out by the sender never arrives here
+    // again. An incremental cloud sync brings it in, so run one at launch,
+    // on resume, and on a timer, each skipped while the last clean sync is
+    // under `CATCH_UP_INTERVAL_MS` old (so a restart does not sign in to
+    // iCloud again).
     #[cfg(feature = "rustpush")]
     {
-        let backend = backend.clone();
-        let store = store.clone();
-        crate::runtime::runtime().spawn(async move {
-            let state_dir = glib::user_data_dir().join("bubbles");
-            let now_unix_ms = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis() as i64)
-                .unwrap_or(0);
-            let threshold_ms = 2 * 60 * 60 * 1000;
+        let catch_up = CatchUp {
+            backend: backend.clone(),
+            store: store.clone(),
+            notify: catch_up_notify,
+        };
 
-            let last_alive = crate::sync::read_last_alive(&state_dir);
-            if crate::sync::should_sync(last_alive, now_unix_ms, threshold_ms)
-                || crate::sync::scan_pending(&state_dir)
-            {
-                let cutoff_ms = last_alive
-                    .unwrap_or(now_unix_ms - 48 * 60 * 60 * 1000)
-                    .max(now_unix_ms - 48 * 60 * 60 * 1000);
-                let sync_result = backend
-                    .sync_missed_messages(&store, cutoff_ms, false)
-                    .await;
-                log::info!("initial sync: {sync_result:?}");
-            } else {
-                log::info!("skipping initial sync: gap < 2h, trusting push");
+        let launch = catch_up.clone();
+        crate::runtime::runtime().spawn(async move {
+            launch.run(CatchUpTrigger::Launch).await;
+        });
+
+        let wake = catch_up.clone();
+        monitor.on_resume(move || {
+            let wake = wake.clone();
+            crate::runtime::runtime().spawn(async move {
+                wake.run(CatchUpTrigger::Wake).await;
+            });
+        });
+
+        // Ticks every minute so the interval is honoured within a minute of
+        // the last sync whoever ran it, and so a tick after resume (tokio's
+        // clock stops while suspended) comes promptly. Most ticks only read
+        // the stamp file.
+        crate::runtime::runtime().spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                catch_up.run(CatchUpTrigger::Periodic).await;
             }
         });
     }
 
-    // --- Wake-from-sleep sync gate ---
-    // Run a sync on resume if the sleep gap exceeded 2 hours. The resume
-    // signal arrives before Wi-Fi has re-associated, so wait for DNS to work
-    // first, and give a sync that still failed on connectivity one more try.
-    #[cfg(feature = "rustpush")]
-    {
-        let backend = backend.clone();
-        let store = store.clone();
-        monitor.on_resume(move || {
-            let backend = backend.clone();
-            let store = store.clone();
-            crate::runtime::runtime().spawn(async move {
-                let state_dir = glib::user_data_dir().join("bubbles");
-                let now_unix_ms = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_millis() as i64)
-                    .unwrap_or(0);
-                let threshold_ms = 2 * 60 * 60 * 1000;
-
-                let last_alive = crate::sync::read_last_alive(&state_dir);
-                if !(crate::sync::should_sync(last_alive, now_unix_ms, threshold_ms)
-                    || crate::sync::scan_pending(&state_dir))
-                {
-                    log::info!("wake sync: skipped (gap < 2h)");
-                    return;
-                }
-                let cutoff_ms = last_alive
-                    .unwrap_or(now_unix_ms - 48 * 60 * 60 * 1000)
-                    .max(now_unix_ms - 48 * 60 * 60 * 1000);
-
-                if !crate::sync::wait_for_network(std::time::Duration::from_secs(60)).await {
-                    log::warn!("wake sync: network not back after 60s; trying anyway");
-                }
-                let mut sync_result = backend
-                    .sync_missed_messages(&store, cutoff_ms, false)
-                    .await;
-                if sync_result
-                    .error
-                    .as_deref()
-                    .is_some_and(crate::sync::is_connectivity_error)
-                {
-                    log::warn!(
-                        "wake sync: connectivity failure ({}); retrying in 15s",
-                        sync_result.error.as_deref().unwrap_or_default()
-                    );
-                    tokio::time::sleep(std::time::Duration::from_secs(15)).await;
-                    sync_result = backend
-                        .sync_missed_messages(&store, cutoff_ms, false)
-                        .await;
-                }
-                log::info!("wake sync: {sync_result:?}");
-            });
-        });
-    }
-
     // --- Proactive APS refresh on resume ---
-    // After wake, sleep 2s for network re-association, then force a fresh
+    // After wake, wait for the network to come back, then force a fresh
     // APS connection so the receive loop can re-subscribe without waiting
-    // for the 60-second keepalive ping.
+    // for the 60-second keepalive ping. Refreshing before DNS works only
+    // fails and leaves the reconnect to the connection's own backoff,
+    // which can add half a minute after the network is already up.
     #[cfg(feature = "rustpush")]
     {
         let connection = connection.clone();
@@ -1416,6 +1472,9 @@ pub fn enter_messaging(
             let connection = connection.clone();
             crate::runtime::runtime().spawn(async move {
                 tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                if !crate::sync::wait_for_network(std::time::Duration::from_secs(60)).await {
+                    log::warn!("APS refresh on resume: network not back after 60s; trying anyway");
+                }
                 match crate::protocol::rustpush_backend::refresh_aps(&connection).await {
                     Ok(()) => log::info!("APS connection refreshed on resume"),
                     Err(e) => log::warn!("APS refresh on resume failed: {e}"),
@@ -1425,9 +1484,9 @@ pub fn enter_messaging(
     }
 
     // --- Periodic last_alive save ---
-    // Write the current timestamp every 5 minutes so the threshold gate
-    // can detect the gap on next launch / wake. Best-effort: crashes lose
-    // up to 5 minutes of staleness (negligible vs. the 2-hour threshold).
+    // Write the current timestamp every 5 minutes; the catch-up sync uses
+    // it as the cutoff for an unfinished initial scan. Best-effort: crashes
+    // lose up to 5 minutes of staleness.
     #[cfg(feature = "rustpush")]
     {
         crate::runtime::runtime().spawn(async move {
