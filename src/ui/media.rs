@@ -174,8 +174,13 @@ fn maybe_adjust_scroll_for_thumbnail(pic: &gtk::Widget, old_h: i32, new_h: i32) 
 /// An image widget that decodes on a background thread and swaps in the
 /// finished texture when ready.  Returns a placeholder immediately so the
 /// chat opens without blocking.
-pub(super) fn image_widget(path: &str, dimensions: Option<(i32, i32)>) -> gtk::Widget {
-    image_widget_with_motion(path, dimensions, None)
+/// `name` is the sender's file name for it, offered when saving.
+pub(super) fn image_widget(
+    path: &str,
+    name: Option<&str>,
+    dimensions: Option<(i32, i32)>,
+) -> gtk::Widget {
+    image_widget_with_motion(path, name, dimensions, None)
 }
 
 /// An image widget with an optional paired motion file.  The still remains the
@@ -183,14 +188,16 @@ pub(super) fn image_widget(path: &str, dimensions: Option<(i32, i32)>) -> gtk::W
 /// button opens the video lightbox without changing the still's click behavior.
 pub(super) fn live_photo_widget(
     still_path: &str,
+    still_name: Option<&str>,
     motion_path: &str,
     dimensions: Option<(i32, i32)>,
 ) -> gtk::Widget {
-    image_widget_with_motion(still_path, dimensions, Some(motion_path))
+    image_widget_with_motion(still_path, still_name, dimensions, Some(motion_path))
 }
 
 fn image_widget_with_motion(
     path: &str,
+    name: Option<&str>,
     dimensions: Option<(i32, i32)>,
     motion_path: Option<&str>,
 ) -> gtk::Widget {
@@ -285,9 +292,12 @@ fn image_widget_with_motion(
         });
     }
 
+    let save_name = suggested_save_name(name, path);
+
     // Click to enlarge: find the lightbox host overlay and layer the full image.
     let gesture = gtk::GestureClick::new();
     let path_owned = path.to_string();
+    let save_name_owned = save_name.clone();
     let motion_path_owned = motion_path.map(str::to_owned);
     let pic_weak = pic.downgrade();
     gesture.connect_released(move |_, _, _, _| {
@@ -300,9 +310,25 @@ fn image_widget_with_motion(
             log::debug!("image click: find_lightbox_host returned None for {path_owned}");
             return;
         };
-        show_lightbox(&host, &path_owned, motion_path_owned.as_deref());
+        show_lightbox(&host, &path_owned, &save_name_owned, motion_path_owned.as_deref());
     });
     pic.add_controller(gesture);
+
+    // Right-click: a menu with Save Image…. Claiming the press keeps the
+    // message row's own right-click menu (reactions, reply) from opening too.
+    let menu_click = gtk::GestureClick::new();
+    menu_click.set_button(gtk::gdk::BUTTON_SECONDARY);
+    menu_click.connect_pressed(|gesture, _, _, _| {
+        gesture.set_state(gtk::EventSequenceState::Claimed);
+    });
+    let path_owned = path.to_string();
+    let pic_weak = pic.downgrade();
+    menu_click.connect_released(move |_, _, x, y| {
+        if let Some(pic) = pic_weak.upgrade() {
+            show_image_menu(&pic, x, y, &path_owned, &save_name);
+        }
+    });
+    pic.add_controller(menu_click);
 
     let Some(motion_path) = motion_path else {
         return viewport.upcast();
@@ -516,10 +542,132 @@ fn find_lightbox_host(w: &gtk::Widget) -> Option<gtk::Overlay> {
     None
 }
 
+/// The image's right-click menu, pointing at the click.
+fn show_image_menu(pic: &gtk::Picture, x: f64, y: f64, path: &str, save_name: &str) {
+    let popover = gtk::Popover::builder().autohide(true).has_arrow(false).build();
+    popover.set_pointing_to(Some(&gtk::gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
+
+    let save = gtk::Button::builder()
+        .label("Save Image…")
+        .css_classes(["flat"])
+        .build();
+    let pic_for_save = pic.clone();
+    let popover_for_save = popover.clone();
+    let path = path.to_string();
+    let save_name = save_name.to_string();
+    save.connect_clicked(move |_| {
+        save_attachment_as(&pic_for_save, &path, &save_name);
+        popover_for_save.popdown();
+    });
+
+    popover.set_child(Some(&save));
+    popover.set_parent(pic);
+    // Unparent on close to avoid accumulating hidden children.
+    popover.connect_closed(|p| p.unparent());
+    popover.popup();
+}
+
+thread_local! {
+    /// The folder the last image was saved to, offered first next time.
+    static LAST_SAVE_FOLDER: RefCell<Option<gtk::gio::File>> = const { RefCell::new(None) };
+}
+
+/// Ask where to save the attachment at `src_path`, offering `suggested_name`,
+/// then copy it there unchanged (HEIC stays HEIC). The copy runs through GIO's
+/// async I/O, so the main loop never blocks. Starts in the folder used last
+/// time, or in Pictures.
+pub(super) fn save_attachment_as(
+    anchor: &impl IsA<gtk::Widget>,
+    src_path: &str,
+    suggested_name: &str,
+) {
+    use gtk::gio;
+
+    let dialog = gtk::FileDialog::builder()
+        .title("Save Image")
+        .modal(true)
+        .initial_name(suggested_name)
+        .build();
+    let folder = LAST_SAVE_FOLDER
+        .with_borrow(|f| f.clone())
+        .or_else(|| glib::user_special_dir(glib::UserDirectory::Pictures).map(gio::File::for_path));
+    if let Some(folder) = folder {
+        dialog.set_initial_folder(Some(&folder));
+    }
+
+    let window = anchor.as_ref().root().and_then(|r| r.downcast::<gtk::Window>().ok());
+    let source = gio::File::for_path(src_path);
+    let alert_parent = window.clone();
+    dialog.save(window.as_ref(), gio::Cancellable::NONE, move |res| {
+        let dest = match res {
+            Ok(dest) => dest,
+            Err(e)
+                if e.matches(gtk::DialogError::Dismissed)
+                    || e.matches(gtk::DialogError::Cancelled) =>
+            {
+                return;
+            }
+            Err(e) => {
+                log::warn!("save image: file dialog failed: {e}");
+                return;
+            }
+        };
+        LAST_SAVE_FOLDER.with_borrow_mut(|f| *f = dest.parent());
+        // Default permissions, not the cache file's private ones.
+        let flags = gio::FileCopyFlags::OVERWRITE | gio::FileCopyFlags::TARGET_DEFAULT_PERMS;
+        source.copy_async(
+            &dest,
+            flags,
+            glib::Priority::DEFAULT,
+            gio::Cancellable::NONE,
+            None,
+            move |res| match res {
+                Ok(()) => log::info!("save image: saved"),
+                Err(e) => {
+                    log::warn!("save image: copy failed: {e}");
+                    let alert = adw::AlertDialog::new(
+                        Some("Couldn't Save Image"),
+                        Some(&e.to_string()),
+                    );
+                    alert.add_response("ok", "OK");
+                    alert.present(alert_parent.as_ref());
+                }
+            },
+        );
+    });
+}
+
+/// The file name to offer when saving an attachment: the sender's own name
+/// for it when there is one, otherwise the cached file's name. Directory parts
+/// are dropped, so a name can't reach outside the chosen folder, and a name
+/// without an extension borrows the cached file's.
+pub(super) fn suggested_save_name(name: Option<&str>, local_path: &str) -> String {
+    let local = std::path::Path::new(local_path);
+    let base = |n: &str| -> Option<String> {
+        let last = n.rsplit(['/', '\\']).next().unwrap_or("").trim();
+        (!last.is_empty() && last != "." && last != "..").then(|| last.to_string())
+    };
+    let Some(mut chosen) = name.and_then(base) else {
+        return local
+            .file_name()
+            .and_then(|n| n.to_str())
+            .and_then(base)
+            .unwrap_or_else(|| "image".to_string());
+    };
+    if std::path::Path::new(&chosen).extension().is_none() {
+        if let Some(ext) = local.extension().and_then(|e| e.to_str()) {
+            chosen.push('.');
+            chosen.push_str(ext);
+        }
+    }
+    chosen
+}
+
 /// Layer a dimmed, centered, full-size image over the UI. Click anywhere or
 /// press Escape to dismiss. A paired motion file gets a corner play affordance
-/// which opens the video lightbox without changing dismissal behavior.
-fn show_lightbox(host: &gtk::Overlay, path: &str, motion_path: Option<&str>) {
+/// which opens the video lightbox without changing dismissal behavior. A
+/// corner button (or Ctrl+S) saves the image under `save_name`.
+fn show_lightbox(host: &gtk::Overlay, path: &str, save_name: &str, motion_path: Option<&str>) {
     log::debug!("show_lightbox: opening {path}");
     let Some(texture) = load_texture(path) else {
         log::warn!("show_lightbox: load_texture returned None for {path}");
@@ -560,6 +708,21 @@ fn show_lightbox(host: &gtk::Overlay, path: &str, motion_path: Option<&str>) {
     } else {
         None
     };
+
+    // The button claims its own clicks, so pressing it doesn't dismiss.
+    let save_button = gtk::Button::from_icon_name("document-save-symbolic");
+    save_button.add_css_class("media-overlay-button");
+    save_button.set_tooltip_text(Some("Save Image… (Ctrl+S)"));
+    save_button.set_halign(gtk::Align::End);
+    save_button.set_valign(gtk::Align::Start);
+    save_button.set_margin_end(16);
+    save_button.set_margin_top(16);
+    {
+        let path = path.to_string();
+        let save_name = save_name.to_string();
+        save_button.connect_clicked(move |b| save_attachment_as(b, &path, &save_name));
+    }
+    content.add_overlay(&save_button);
     dim.append(&content);
 
     // Toplevel window for reliable key event capture.
@@ -573,8 +736,15 @@ fn show_lightbox(host: &gtk::Overlay, path: &str, motion_path: Option<&str>) {
     let host_k = host.clone();
     let dim_k = dim.clone();
     let tl_esc = toplevel.clone();
-    keys.connect_key_pressed(move |ctrl, key, _, _| {
-        if key == gtk::gdk::Key::Escape && dim_k.parent().is_some() {
+    let path_k = path.to_string();
+    let save_name_k = save_name.to_string();
+    keys.connect_key_pressed(move |ctrl, key, _, modifiers| {
+        let ctrl_s = modifiers.contains(gtk::gdk::ModifierType::CONTROL_MASK)
+            && (key == gtk::gdk::Key::s || key == gtk::gdk::Key::S);
+        if ctrl_s && dim_k.parent().is_some() {
+            save_attachment_as(&dim_k, &path_k, &save_name_k);
+            glib::Propagation::Stop
+        } else if key == gtk::gdk::Key::Escape && dim_k.parent().is_some() {
             if let Some(ref win) = tl_esc {
                 win.remove_controller(ctrl);
             }
@@ -735,4 +905,41 @@ fn show_video_lightbox(host: &gtk::Overlay, path: &str) {
     dim.add_controller(dismiss_gesture);
 
     host.add_overlay(&dim);
+}
+
+#[cfg(test)]
+mod save_name_tests {
+    use super::suggested_save_name;
+
+    const CACHED: &str = "/home/u/.local/share/bubbles/attachments/1b9d6bcd-bbfd-4b2d-9b5d-ab8dfbbd4bed_0.heic";
+
+    #[test]
+    fn offers_the_senders_name() {
+        assert_eq!(suggested_save_name(Some("IMG_4821.HEIC"), CACHED), "IMG_4821.HEIC");
+    }
+
+    #[test]
+    fn drops_directory_parts_of_the_senders_name() {
+        assert_eq!(suggested_save_name(Some("../../.ssh/IMG_1.jpeg"), CACHED), "IMG_1.jpeg");
+        assert_eq!(suggested_save_name(Some("C:\\Users\\x\\IMG_2.jpeg"), CACHED), "IMG_2.jpeg");
+    }
+
+    #[test]
+    fn falls_back_to_the_cached_file_name() {
+        let cached = "1b9d6bcd-bbfd-4b2d-9b5d-ab8dfbbd4bed_0.heic";
+        assert_eq!(suggested_save_name(None, CACHED), cached);
+        assert_eq!(suggested_save_name(Some("  "), CACHED), cached);
+        assert_eq!(suggested_save_name(Some(".."), CACHED), cached);
+        assert_eq!(suggested_save_name(Some("photos/"), CACHED), cached);
+    }
+
+    #[test]
+    fn borrows_the_cached_extension_when_the_name_has_none() {
+        assert_eq!(suggested_save_name(Some("image"), CACHED), "image.heic");
+    }
+
+    #[test]
+    fn says_image_when_nothing_usable_is_left() {
+        assert_eq!(suggested_save_name(None, "/"), "image");
+    }
 }

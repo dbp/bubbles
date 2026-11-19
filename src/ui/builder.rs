@@ -996,7 +996,11 @@ fn message_body(
             AttachmentGroup::Single(att) => match att.kind() {
                 AttachmentKind::Image => {
                     if let Some(path) = att.local_path.as_deref() {
-                        col.append(&image_widget(path, att.width.zip(att.height)));
+                        col.append(&image_widget(
+                            path,
+                            att.name.as_deref(),
+                            att.width.zip(att.height),
+                        ));
                     }
                 }
                 AttachmentKind::Video => {
@@ -1012,9 +1016,14 @@ fn message_body(
                 if let Some(still_path) = still.local_path.as_deref() {
                     let dimensions = still.width.zip(still.height);
                     if let Some(motion_path) = motion.local_path.as_deref() {
-                        col.append(&live_photo_widget(still_path, motion_path, dimensions));
+                        col.append(&live_photo_widget(
+                            still_path,
+                            still.name.as_deref(),
+                            motion_path,
+                            dimensions,
+                        ));
                     } else {
-                        col.append(&image_widget(still_path, dimensions));
+                        col.append(&image_widget(still_path, still.name.as_deref(), dimensions));
                     }
                 } else if let Some(motion_path) = motion.local_path.as_deref() {
                     // Keep a partially cached pair visible if its still has not

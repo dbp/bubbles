@@ -148,7 +148,7 @@ const CSS: &str = "
   border-radius: 14px;
   background-color: #00000010;
 }
-.live-photo-button {
+.live-photo-button, .media-overlay-button {
   min-width: 32px;
   min-height: 32px;
   padding: 4px;
@@ -156,7 +156,7 @@ const CSS: &str = "
   background-color: alpha(#000000, 0.72);
   color: #ffffff;
 }
-.live-photo-button:hover {
+.live-photo-button:hover, .media-overlay-button:hover {
   background-color: alpha(#000000, 0.86);
 }
 .lightbox-dim {
